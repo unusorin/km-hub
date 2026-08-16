@@ -1,13 +1,15 @@
-//! Slot hooks: user commands run when a slot is activated with Ctrl+Alt+Shift+F<n>.
+//! Slot hooks and macros: user commands run when a slot is activated with
+//! Ctrl+Alt+Shift+F<n> (`[[hook]]`) or when a configured key combo is pressed
+//! (`[[macro]]`).
 //!
 //! km-hub knows nothing about what a hook does — it spawns the command and
 //! forgets about it. That keeps the hub generic: pointing a hook at `curl`,
 //! `hass-cli` or a shell script is the user's business, not the tool's.
 //!
 //! Same contract as the lighting task: a hook can neither delay nor block a
-//! switch. The router hands events over with `try_send` and never waits, every
-//! command runs in its own task under a timeout, and every failure is a log
-//! line and nothing more.
+//! switch (or a keystroke). The router hands events over with `try_send` and
+//! never waits, every command runs in its own task under a timeout, and every
+//! failure is a log line and nothing more.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -19,27 +21,38 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::config::{Hook, HookCommand};
+use crate::config::{Hook, HookCommand, Macro};
 
-/// Ceiling on concurrently running hooks. Reached only if commands hang while
-/// slots are switched repeatedly; skipping beats forking without bound on a Pi.
+/// Ceiling on concurrently running hooks and macros together. Reached only if
+/// commands hang while combos are pressed repeatedly; skipping beats forking
+/// without bound on a Pi.
 const MAX_IN_FLIGHT: usize = 16;
+
+/// What the router asks the task to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookEvent {
+    /// The slot the user asked to fire. One message per hook-combo press,
+    /// whether or not it also changed the active target.
+    Slot(u8),
+    /// A macro combo was pressed; index into `HookDeps::macros`.
+    Macro(usize),
+}
 
 pub struct HookDeps {
     pub hooks: Vec<Hook>,
-    /// The slot the user asked to fire. One message per hook-combo press,
-    /// whether or not it also changed the active target.
-    pub event_rx: mpsc::Receiver<u8>,
+    pub macros: Vec<Macro>,
+    pub event_rx: mpsc::Receiver<HookEvent>,
     pub cancel: CancellationToken,
 }
 
 pub async fn run(deps: HookDeps) -> Result<()> {
     let HookDeps {
         hooks,
+        macros,
         mut event_rx,
         cancel,
     } = deps;
-    info!(hooks = hooks.len(), "slot hooks armed");
+    info!(hooks = hooks.len(), macros = macros.len(), "slot hooks and macros armed");
 
     let mut running: JoinSet<()> = JoinSet::new();
     loop {
@@ -47,8 +60,12 @@ pub async fn run(deps: HookDeps) -> Result<()> {
             _ = cancel.cancelled() => break,
             // Reap finished commands so `running.len()` is a live count.
             Some(_) = running.join_next() => {}
-            slot = event_rx.recv() => match slot {
-                Some(slot) => spawn_matching(&hooks, slot, &mut running),
+            event = event_rx.recv() => match event {
+                Some(HookEvent::Slot(slot)) => spawn_matching(&hooks, slot, &mut running),
+                Some(HookEvent::Macro(index)) => match macros.get(index) {
+                    Some(m) => spawn_one(&m.label, &m.command, m.timeout, &mut running),
+                    None => warn!(index, "macro index out of range — ignoring"),
+                },
                 None => break,
             },
         }
@@ -59,24 +76,27 @@ pub async fn run(deps: HookDeps) -> Result<()> {
     if !running.is_empty() {
         warn!(in_flight = running.len(), "shutting down with hooks still running — killing them");
     }
-    info!("slot hooks stopped");
+    info!("slot hooks and macros stopped");
     Ok(())
 }
 
 fn spawn_matching(hooks: &[Hook], slot: u8, running: &mut JoinSet<()>) {
     for hook in hooks.iter().filter(|h| h.slot == slot) {
-        if running.len() >= MAX_IN_FLIGHT {
-            warn!(
-                slot,
-                hook = hook.label,
-                in_flight = running.len(),
-                "too many hooks still running — skipping this one"
-            );
-            continue;
-        }
-        let (label, command, timeout) = (hook.label.clone(), hook.command.clone(), hook.timeout);
-        running.spawn(async move { exec(&label, &command, timeout).await });
+        spawn_one(&hook.label, &hook.command, hook.timeout, running);
     }
+}
+
+fn spawn_one(label: &str, command: &HookCommand, timeout: Duration, running: &mut JoinSet<()>) {
+    if running.len() >= MAX_IN_FLIGHT {
+        warn!(
+            hook = label,
+            in_flight = running.len(),
+            "too many hooks still running — skipping this one"
+        );
+        return;
+    }
+    let (label, command) = (label.to_string(), command.clone());
+    running.spawn(async move { exec(&label, &command, timeout).await });
 }
 
 /// Run one command to completion (or to its timeout). Never returns an error:
@@ -157,22 +177,39 @@ mod tests {
         false
     }
 
-    async fn start(hooks: Vec<Hook>) -> (mpsc::Sender<u8>, CancellationToken) {
+    async fn start(hooks: Vec<Hook>) -> (mpsc::Sender<HookEvent>, CancellationToken) {
+        start_with(hooks, Vec::new()).await
+    }
+
+    async fn start_with(
+        hooks: Vec<Hook>,
+        macros: Vec<Macro>,
+    ) -> (mpsc::Sender<HookEvent>, CancellationToken) {
         let (tx, event_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         tokio::spawn(run(HookDeps {
             hooks,
+            macros,
             event_rx,
             cancel: cancel.clone(),
         }));
         (tx, cancel)
     }
 
+    fn a_macro(keys: &str, command: HookCommand) -> Macro {
+        Macro {
+            combo: keys.parse().unwrap(),
+            label: format!("test macro {keys}"),
+            command,
+            timeout: Duration::from_secs(5),
+        }
+    }
+
     #[tokio::test]
     async fn a_hook_runs_when_its_slot_activates() {
         let path = marker("runs");
         let (tx, cancel) = start(vec![hook(2, argv(&["touch", &path.to_string_lossy()]))]).await;
-        tx.send(2).await.unwrap();
+        tx.send(HookEvent::Slot(2)).await.unwrap();
         assert!(wait_for(&path).await, "hook did not run");
         cancel.cancel();
         let _ = std::fs::remove_file(&path);
@@ -186,7 +223,7 @@ mod tests {
             hook(3, argv(&["touch", &three.to_string_lossy()])),
         ])
         .await;
-        tx.send(3).await.unwrap();
+        tx.send(HookEvent::Slot(3)).await.unwrap();
         assert!(wait_for(&three).await, "slot 3 hook did not run");
         // Slot 3's hook is done, so slot 2's would have run by now if it were
         // going to.
@@ -215,7 +252,7 @@ mod tests {
             hook(2, argv(&["touch", &one_arg.to_string_lossy()])),
         ])
         .await;
-        tx.send(2).await.unwrap();
+        tx.send(HookEvent::Slot(2)).await.unwrap();
 
         assert!(wait_for(&expanded).await, "shell form was not interpreted by sh");
         assert!(wait_for(&one_arg).await, "argv form did not create the spaced filename");
@@ -235,8 +272,8 @@ mod tests {
             hook(3, argv(&["touch", &path.to_string_lossy()])),
         ])
         .await;
-        tx.send(2).await.unwrap();
-        tx.send(3).await.unwrap();
+        tx.send(HookEvent::Slot(2)).await.unwrap();
+        tx.send(HookEvent::Slot(3)).await.unwrap();
         assert!(wait_for(&path).await, "task died on the failing hooks");
         cancel.cancel();
         let _ = std::fs::remove_file(&path);
@@ -248,11 +285,36 @@ mod tests {
         let mut slow = hook(2, argv(&["sleep", "60"]));
         slow.timeout = Duration::from_millis(200);
         let (tx, cancel) = start(vec![slow, hook(3, argv(&["touch", &path.to_string_lossy()]))]).await;
-        tx.send(2).await.unwrap();
+        tx.send(HookEvent::Slot(2)).await.unwrap();
         // The killed hook must not hold the task: a later switch still fires.
-        tx.send(3).await.unwrap();
+        tx.send(HookEvent::Slot(3)).await.unwrap();
         assert!(wait_for(&path).await, "task was blocked by the slow hook");
         cancel.cancel();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_macro_runs_by_index_and_hooks_stay_separate() {
+        let (one, two, hook_path) = (marker("macro-1"), marker("macro-2"), marker("macro-hook"));
+        let (tx, cancel) = start_with(
+            vec![hook(2, argv(&["touch", &hook_path.to_string_lossy()]))],
+            vec![
+                a_macro("ctrl+alt+kp1", argv(&["touch", &one.to_string_lossy()])),
+                a_macro("ctrl+alt+kp2", argv(&["touch", &two.to_string_lossy()])),
+            ],
+        )
+        .await;
+        tx.send(HookEvent::Macro(1)).await.unwrap();
+        assert!(wait_for(&two).await, "macro 1 did not run");
+        assert!(!one.exists(), "macro 0 ran for a macro 1 event");
+        assert!(!hook_path.exists(), "a slot hook ran for a macro event");
+        // Out of range is logged and ignored; the task keeps serving.
+        tx.send(HookEvent::Macro(7)).await.unwrap();
+        tx.send(HookEvent::Macro(0)).await.unwrap();
+        assert!(wait_for(&one).await, "macro 0 did not run after a bad index");
+        cancel.cancel();
+        for p in [one, two, hook_path] {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }

@@ -16,8 +16,10 @@ use crate::bt::BtCmd;
 use crate::config::LOCAL_SLOT;
 use crate::hid::HidFrame;
 use crate::hid::translate::Translator;
+use crate::hooks::HookEvent;
 use crate::input::LocalSink;
 use crate::input::hotkey::{HotkeyFsm, Verdict};
+use crate::input::keys::KeyCombo;
 use crate::rgb::{Activity, RgbEvent};
 use crate::state::Bindings;
 
@@ -33,8 +35,9 @@ pub struct Router {
     bt_tx: mpsc::Sender<(u8, HidFrame)>,
     bt_cmd_tx: mpsc::Sender<BtCmd>,
     slot_tx: watch::Sender<u8>,
-    /// Slot activations for the hook task. `None` when no hooks are configured.
-    hook_tx: Option<mpsc::Sender<u8>>,
+    /// Slot activations and macro presses for the hook task. `None` when
+    /// neither hooks nor macros are configured.
+    hook_tx: Option<mpsc::Sender<HookEvent>>,
     /// Keeps the lighting awake while the user is at the desk. `None` when
     /// lighting is off.
     activity: Option<Activity>,
@@ -74,7 +77,9 @@ pub struct RouterDeps {
     pub bt_tx: mpsc::Sender<(u8, HidFrame)>,
     pub bt_cmd_tx: mpsc::Sender<BtCmd>,
     pub slot_tx: watch::Sender<u8>,
-    pub hook_tx: Option<mpsc::Sender<u8>>,
+    pub hook_tx: Option<mpsc::Sender<HookEvent>>,
+    /// Macro combos in config order; the FSM reports one by its index.
+    pub macros: Vec<KeyCombo>,
     pub activity: Option<Activity>,
     pub rgb_tx: Option<mpsc::Sender<RgbEvent>>,
     pub bindings_rx: watch::Receiver<Bindings>,
@@ -89,6 +94,7 @@ impl Router {
             bt_cmd_tx,
             slot_tx,
             hook_tx,
+            macros,
             activity,
             rgb_tx,
             bindings_rx,
@@ -97,7 +103,7 @@ impl Router {
         let mouse_interval = Duration::from_micros(1_000_000 / u64::from(mouse_rate_hz.max(1)));
         Self {
             slot: LOCAL_SLOT,
-            fsm: HotkeyFsm::new(),
+            fsm: HotkeyFsm::with_macros(macros),
             translator: Translator::new(),
             sink,
             bt_tx,
@@ -198,6 +204,7 @@ impl Router {
             EventSummary::Key(_, key, value) => match self.fsm.on_key(key, value) {
                 Verdict::Swallow => {}
                 Verdict::SwitchTo { slot, fire_hooks } => self.switch_to(slot, fire_hooks)?,
+                Verdict::RunMacro { index, held_mods } => self.run_macro(index, &held_mods)?,
                 Verdict::Pass => {
                     if self.slot == LOCAL_SLOT {
                         match value {
@@ -340,10 +347,41 @@ impl Router {
 
     fn notify_hooks(&self, slot: u8) {
         if let Some(tx) = &self.hook_tx
-            && tx.try_send(slot).is_err()
+            && tx.try_send(HookEvent::Slot(slot)).is_err()
         {
             warn!(slot, "hook task not accepting events — skipping this activation");
         }
+    }
+
+    /// A macro combo was pressed: same fire-and-forget hand-off as a hook, on
+    /// whatever slot is active. The combo itself was swallowed by the FSM —
+    /// but its modifiers were forwarded as pressed *before* the trigger made
+    /// it a combo, and their releases will be swallowed too. A switch releases
+    /// everything on the target it leaves; a macro leaves nothing, so release
+    /// those modifiers here or the target keeps a phantom Ctrl held down.
+    fn run_macro(&mut self, index: usize, held_mods: &[KeyCode]) -> Result<()> {
+        debug!(index, slot = self.slot, ?held_mods, "macro combo pressed");
+        if self.slot == LOCAL_SLOT {
+            let held: Vec<KeyCode> = held_mods
+                .iter()
+                .copied()
+                .filter(|k| self.local_held.remove(k))
+                .collect();
+            if !held.is_empty() {
+                self.sink.release_keys(&held)?;
+            }
+        } else {
+            for key in held_mods {
+                self.translator.handle_key(*key, 0);
+            }
+            self.flush_remote();
+        }
+        if let Some(tx) = &self.hook_tx
+            && tx.try_send(HookEvent::Macro(index)).is_err()
+        {
+            warn!(index, "hook task not accepting events — skipping this macro");
+        }
+        Ok(())
     }
 
     /// Never block on the Bluetooth side: a stalled link must not

@@ -14,6 +14,8 @@ with `Ctrl+Alt+F<n>`. Nothing to install on the clients — pair once, then swit
   slot to a different machine.
 - Adding **Shift** (`Ctrl+Alt+Shift+F<n>`) switches *and* runs that slot's [hooks](#hooks-optional).
   Plain switching is silent, so you can look at another machine without also throwing the monitor over.
+- Any other combo you configure (`Ctrl+Alt+KP1`, `Super+F13`, …) is a [macro](#macros-optional):
+  it runs a command on the hub, on whichever slot is active, and never reaches the target.
 - All paired hosts stay connected; switching is instant. Keys held during a switch are released
   on the host you leave.
 
@@ -55,6 +57,7 @@ make deploy             # cargo build --release --target aarch64 + rsync + setca
 make setup              # one-time system setup on the Pi (interactive)
 make run                # run in the foreground on the Pi (Ctrl-C to stop)
 make ssh                # shell on the Pi in the project dir
+make pull-config        # copy config.toml back from the Pi (after `km-hub macro add` there)
 ```
 
 Command-line variables still override `.env` (`make deploy PI=admin@other-host`). This local
@@ -188,6 +191,53 @@ timeout is killed. Config is read once at startup, so restart km-hub after editi
 Note the Shift combo is swallowed whole, exactly like the plain one — no stray Shift reaches either
 machine. Holding it for 3 s still means re-pair; that gesture is about the held F-key, not Shift.
 
+### Macros (optional)
+
+A macro runs a command when you press a key combo of your own — on **any** slot, without switching.
+The combo is swallowed exactly like `Ctrl+Alt+F<n>`: the trigger, its repeats and the releases of
+the modifiers that formed it never reach the machine you are typing on (the modifiers were already
+down there, so km-hub releases them on that machine itself — nothing stays stuck). Same `run`
+forms, timeout and fire-and-forget contract as hooks:
+
+```toml
+[[macro]]
+keys = "ctrl+alt+kp1"
+name = "desk lamp"             # optional, only used in log lines
+run  = "curl -fsS -XPOST http://ha.local:8123/api/webhook/km-lamp"
+
+[[macro]]
+keys = "ctrl+alt+shift+kp1"
+run  = ["/home/admin/bin/lamp.sh", "off"]
+# timeout_secs = 30            # default 10, max 300
+```
+
+`keys` is `+`-separated and case-insensitive: the modifiers `ctrl`, `alt`, `shift`, `super`
+(either side counts) plus exactly one other key, named as its evdev constant without `KEY_`,
+lowercased — `kp1`, `f13`, `a`, `1`, `pause`, `prog1`, `mute`. Modifiers match **exactly**:
+`ctrl+alt+kp1` does not fire while Shift is also down, which is what lets `ctrl+alt+kp1` and
+`ctrl+alt+shift+kp1` be two different macros. A macro fires on the press only, never on
+auto-repeat. `Ctrl+Alt+F1..F12` (with any extra modifier) belong to slot switching and are
+rejected, as is binding one combo twice. A key without any modifier is allowed — gaming keyboards
+have dedicated macro keys — but that key is then taken on every target, and km-hub warns at
+startup. Nothing is passed to the command; one macro is one command. Config is read once at
+startup, so restart km-hub after editing.
+
+You don't have to guess key names. On the hub:
+
+```sh
+./km-hub macro capture     # press a combo → prints e.g. ctrl+alt+kp1
+./km-hub macro add         # press a combo, answer name / command / shell? / timeout →
+                           # appends the [[macro]] to config.toml (comments kept)
+```
+
+`macro add` refuses reserved combos and offers to replace an existing macro bound to the same
+combo. If km-hub is **running** it holds the physical keyboards, so the tool reads km-hub's own
+virtual keyboard instead: be on the **local slot** (`Ctrl+Alt+F1`), and note that combos km-hub
+already claims (switch combos, existing macros) are swallowed before the tool can see them. If
+km-hub is stopped, the physical keyboards are read directly. Either way, restart km-hub afterwards.
+Because `make sync` / `make deploy` push the *host's* `config.toml` to the Pi, run
+`make pull-config` on the host after using `macro add` on the Pi, or the next sync overwrites it.
+
 ## Run
 
 ```sh
@@ -242,6 +292,12 @@ A systemd unit is provided (`km-hub.service`, `make install`) if you want it on 
   `RUST_LOG=km_hub=debug` to see each hook spawn and exit. `$VARS` only expand in the string form;
   in the array form they are literal. A hook inherits km-hub's environment, so a token set only in
   your login shell won't be there — put it in `km-hub.service`.
+- *A macro doesn't fire* — modifiers match exactly: with Shift (or Super) also down, `ctrl+alt+kp1`
+  is a different combo. Check `slot hooks and macros armed` in the log with the expected `macros=`
+  count, and that you restarted after editing. `./km-hub macro capture` shows what a press is
+  called; if it prints nothing while km-hub runs, you are not on the local slot or the combo is
+  already taken (switch combos and existing macros never reach the tool). Everything else in the
+  hook bullet above applies (`RUST_LOG=km_hub=debug`, environment, string vs array).
 - *Mouse feels sluggish on a client* — check the mouse's own report rate first
   (`sudo cat /dev/hidrawN | …`); a 62.5–125 Hz office mouse is the ceiling regardless of the link.
 
@@ -250,11 +306,12 @@ A systemd unit is provided (`km-hub.service`, `make install`) if you want it on 
 ```
 src/main.rs        wiring: config, input readers, router, Bluetooth task
 src/router.rs      hotkey FSM → local sink or HID translator; mouse pacing; slot switching
-src/input/         evdev grab + uinput passthrough, hotkey detection
+src/input/         evdev grab + uinput passthrough, hotkey + macro combo detection, key names
 src/hid/           report descriptor, evdev → HID report translation
 src/bt/            BlueZ session, pairing windows, slot bindings; L2CAP HID and LE/GATT transports
 src/rgb/           slot lighting: OpenRGB SDK client + per-slot color state machine
-src/hooks.rs       user commands run on Ctrl+Alt+Shift+F<n>
+src/hooks.rs       user commands run on Ctrl+Alt+Shift+F<n> and on macro combos
+src/macro_cli.rs   `km-hub macro capture|add`: name a combo, write a [[macro]] into config.toml
 src/config.rs      config.toml         src/state.rs   state.toml (learned bindings)
 setup.sh           system prerequisites (idempotent, --undo)
 Makefile           cross-build + upload over ssh (parameters from .env, see .env.example)

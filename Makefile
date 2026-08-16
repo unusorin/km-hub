@@ -4,6 +4,7 @@
 #   make sync      rsync setup.sh / km-hub.service / config*.toml / README.md to the Pi
 #   make deploy    build + sync + upload the binary + setcap (no restart)
 #   make setup     run setup.sh on the Pi (udev, bluetoothd -P input, class)
+#   make pull-config  copy config.toml back from the Pi (after `km-hub macro add` there)
 #   make run       run the daemon in the foreground on the Pi (Ctrl-C to stop)
 #   make install   install + enable a systemd unit on the Pi
 #   make restart / stop / logs / status
@@ -31,7 +32,7 @@ SSH        = ssh -o BatchMode=yes $(PI)
 # on the Pi and never uploaded.
 SUPPORT    = setup.sh km-hub.service config.toml config.example.toml README.md
 
-.PHONY: check build sync deploy setup run install restart stop status logs ssh clean-remote pi-required
+.PHONY: check build sync deploy setup pull-config run install restart stop status logs ssh clean-remote pi-required
 
 check:
 	cargo check
@@ -53,6 +54,11 @@ deploy: build sync
 
 setup: sync
 	ssh -t $(PI) 'cd $(REMOTE_DIR) && ./setup.sh'
+
+# `km-hub macro add` edits config.toml on the Pi; sync/deploy push this copy
+# over it, so bring the edited one back first.
+pull-config: pi-required
+	rsync -az --info=stats1 $(PI):$(REMOTE_DIR)/config.toml config.toml
 
 run: deploy
 	ssh -t $(PI) 'cd $(REMOTE_DIR) && sudo systemctl stop km-hub 2>/dev/null; RUST_LOG=$(RUST_LOG) ./km-hub --transport $(TRANSPORT)'

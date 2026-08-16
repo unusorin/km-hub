@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use tracing::warn;
 
+use crate::input::keys::KeyCombo;
 use crate::rgb::Rgb;
 
 /// Slot 1 is always the local host (Ctrl+Alt+F1).
@@ -33,6 +35,9 @@ struct RawConfig {
     /// hook task never starts.
     #[serde(rename = "hook", default)]
     hooks: Vec<RawHook>,
+    /// Commands run on a key combo, on any slot. Empty means nothing extra.
+    #[serde(rename = "macro", default)]
+    macros: Vec<RawMacro>,
 }
 
 fn default_mouse_rate_hz() -> u32 {
@@ -63,6 +68,18 @@ struct RawHook {
     timeout_secs: u64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMacro {
+    /// e.g. "ctrl+alt+kp1"; see `input::keys`.
+    keys: String,
+    run: RawRun,
+    /// Shown in log lines; defaults to the canonical combo string.
+    name: Option<String>,
+    #[serde(default = "default_hook_timeout_secs")]
+    timeout_secs: u64,
+}
+
 /// A bare string goes through `sh -c`, so `$VARS`, pipes and redirection work.
 /// An array is exec'd directly, so nothing is interpreted — pick per hook.
 #[derive(Debug, Deserialize)]
@@ -70,6 +87,25 @@ struct RawHook {
 enum RawRun {
     Shell(String),
     Argv(Vec<String>),
+}
+
+/// Shared by hooks and macros: reject an empty command, clamp the timeout.
+fn resolve_run(what: &str, label: &str, run: RawRun, timeout_secs: u64) -> Result<(HookCommand, Duration)> {
+    let command = match run {
+        RawRun::Shell(line) if line.trim().is_empty() => {
+            bail!("{what} '{label}': run is empty")
+        }
+        RawRun::Shell(line) => HookCommand::Shell(line),
+        RawRun::Argv(argv) => {
+            // An empty program would hand execvp("") to the kernel and
+            // surface as a puzzling ENOENT at switch time instead.
+            if argv.first().is_none_or(|program| program.is_empty()) {
+                bail!("{what} '{label}': run is empty");
+            }
+            HookCommand::Argv(argv)
+        }
+    };
+    Ok((command, Duration::from_secs(timeout_secs.clamp(1, 300))))
 }
 
 fn default_hook_timeout_secs() -> u64 {
@@ -159,6 +195,16 @@ pub enum HookCommand {
 #[derive(Debug, Clone)]
 pub struct Hook {
     pub slot: u8,
+    /// For log lines only.
+    pub label: String,
+    pub command: HookCommand,
+    pub timeout: Duration,
+}
+
+/// A command to run when `combo` is pressed, whatever the active slot.
+#[derive(Debug, Clone)]
+pub struct Macro {
+    pub combo: KeyCombo,
     /// For log lines only.
     pub label: String,
     pub command: HookCommand,
@@ -279,6 +325,8 @@ pub struct Settings {
     pub rgb: RgbSettings,
     pub targets: Vec<RemoteTarget>,
     pub hooks: Vec<Hook>,
+    /// In file order; the hotkey FSM reports a macro by its index here.
+    pub macros: Vec<Macro>,
 }
 
 impl Settings {
@@ -292,7 +340,7 @@ impl Settings {
         Self::parse(&text).with_context(|| format!("invalid config {}", path.display()))
     }
 
-    fn parse(text: &str) -> Result<Self> {
+    pub fn parse(text: &str) -> Result<Self> {
         let raw: RawConfig = toml::from_str(text)?;
 
         let mut targets = Vec::new();
@@ -344,25 +392,45 @@ impl Settings {
             if h.slot < LOCAL_SLOT || h.slot > MAX_SLOT {
                 bail!("hook '{label}': slot must be {LOCAL_SLOT}..={MAX_SLOT}");
             }
-            let command = match h.run {
-                RawRun::Shell(line) if line.trim().is_empty() => {
-                    bail!("hook '{label}': run is empty")
-                }
-                RawRun::Shell(line) => HookCommand::Shell(line),
-                RawRun::Argv(argv) => {
-                    // An empty program would hand execvp("") to the kernel and
-                    // surface as a puzzling ENOENT at switch time instead.
-                    if argv.first().is_none_or(|program| program.is_empty()) {
-                        bail!("hook '{label}': run is empty");
-                    }
-                    HookCommand::Argv(argv)
-                }
-            };
+            let (command, timeout) = resolve_run("hook", &label, h.run, h.timeout_secs)?;
             hooks.push(Hook {
                 slot: h.slot,
                 label,
                 command,
-                timeout: Duration::from_secs(h.timeout_secs.clamp(1, 300)),
+                timeout,
+            });
+        }
+
+        let mut macros: Vec<Macro> = Vec::new();
+        for m in raw.macros {
+            let combo: KeyCombo = m
+                .keys
+                .parse()
+                .with_context(|| format!("macro '{}': invalid keys", m.name.as_deref().unwrap_or(&m.keys)))?;
+            let label = m.name.unwrap_or_else(|| combo.to_string());
+            if combo.is_reserved() {
+                bail!(
+                    "macro '{label}': {combo} is reserved — Ctrl+Alt+F1..F12 (with any extra \
+                     modifier) switch slots"
+                );
+            }
+            if let Some(other) = macros.iter().find(|o| o.combo == combo) {
+                bail!("macro '{label}': {combo} is already bound by macro '{}'", other.label);
+            }
+            if combo.mods.is_empty() {
+                // Legal (dedicated macro keys exist), but a bare letter is more
+                // likely a typo — and it will be swallowed on every target.
+                warn!(
+                    "macro '{label}': '{combo}' has no modifier — that key alone will run the \
+                     macro and never reach any target"
+                );
+            }
+            let (command, timeout) = resolve_run("macro", &label, m.run, m.timeout_secs)?;
+            macros.push(Macro {
+                combo,
+                label,
+                command,
+                timeout,
             });
         }
 
@@ -373,6 +441,7 @@ impl Settings {
             rgb,
             targets,
             hooks,
+            macros,
         })
     }
 
@@ -657,5 +726,99 @@ mod tests {
     #[test]
     fn unknown_hook_keys_are_rejected() {
         assert!(Settings::parse("[[hook]]\nslot = 2\nrun = \"true\"\non = \"activated\"").is_err());
+    }
+
+    #[test]
+    fn macros_are_absent_by_default() {
+        assert!(Settings::parse("adapter_alias = \"hub\"").unwrap().macros.is_empty());
+    }
+
+    #[test]
+    fn a_macro_takes_keys_and_a_shell_string_or_argv_array() {
+        let settings = Settings::parse(
+            r#"
+            [[macro]]
+            keys = "Ctrl+Alt+KP1"
+            run = "curl -fsS http://ha/x"
+
+            [[macro]]
+            keys = "ctrl+alt+shift+kp1"
+            name = "lamp"
+            run = ["/usr/local/bin/lamp", "on"]
+            timeout_secs = 0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(settings.macros.len(), 2);
+        assert_eq!(settings.macros[0].combo, "ctrl+alt+kp1".parse().unwrap());
+        assert_eq!(settings.macros[0].command, HookCommand::Shell("curl -fsS http://ha/x".into()));
+        // Without a name, log lines fall back to the canonical combo.
+        assert_eq!(settings.macros[0].label, "ctrl+alt+kp1");
+        assert_eq!(settings.macros[0].timeout, Duration::from_secs(10));
+        assert_eq!(settings.macros[1].label, "lamp");
+        assert_eq!(
+            settings.macros[1].command,
+            HookCommand::Argv(vec!["/usr/local/bin/lamp".into(), "on".into()])
+        );
+        assert_eq!(settings.macros[1].timeout, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_macro_with_unknown_keys_names_the_token() {
+        let err = Settings::parse("[[macro]]\nkeys = \"ctrl+bogus\"\nrun = \"true\"").unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("bogus"), "{message}");
+        assert!(Settings::parse("[[macro]]\nkeys = \"ctrl+alt\"\nrun = \"true\"").is_err());
+        assert!(Settings::parse("[[macro]]\nkeys = \"ctrl+a+b\"\nrun = \"true\"").is_err());
+    }
+
+    #[test]
+    fn a_macro_on_a_switch_combo_is_rejected() {
+        for keys in ["ctrl+alt+f2", "alt+ctrl+shift+f12", "ctrl+alt+super+f1"] {
+            let err = Settings::parse(&format!("[[macro]]\nkeys = \"{keys}\"\nrun = \"true\""))
+                .unwrap_err();
+            assert!(format!("{err:#}").contains("reserved"), "{keys}");
+        }
+        // Neighbours are fine.
+        assert!(Settings::parse("[[macro]]\nkeys = \"ctrl+alt+f13\"\nrun = \"true\"").is_ok());
+        assert!(Settings::parse("[[macro]]\nkeys = \"ctrl+shift+f2\"\nrun = \"true\"").is_ok());
+    }
+
+    #[test]
+    fn duplicate_macro_combos_are_rejected_across_spellings() {
+        let err = Settings::parse(
+            "[[macro]]\nkeys = \"ctrl+alt+kp1\"\nname = \"first\"\nrun = \"true\"\n\
+             [[macro]]\nkeys = \"Alt+Ctrl+KP1\"\nrun = \"true\"",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("first"));
+        // Differing only by a modifier is a different combo.
+        assert!(
+            Settings::parse(
+                "[[macro]]\nkeys = \"ctrl+alt+kp1\"\nrun = \"true\"\n\
+                 [[macro]]\nkeys = \"ctrl+alt+shift+kp1\"\nrun = \"true\""
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_bare_key_macro_is_accepted() {
+        let settings = Settings::parse("[[macro]]\nkeys = \"prog1\"\nrun = \"true\"").unwrap();
+        assert!(settings.macros[0].combo.mods.is_empty());
+    }
+
+    #[test]
+    fn an_empty_macro_run_is_rejected() {
+        for run in ["\"\"", "[]", "[\"\"]"] {
+            let err = Settings::parse(&format!("[[macro]]\nkeys = \"ctrl+alt+kp1\"\nrun = {run}"))
+                .unwrap_err();
+            assert!(format!("{err:#}").contains("empty"), "{run}");
+        }
+    }
+
+    #[test]
+    fn unknown_macro_keys_are_rejected() {
+        assert!(Settings::parse("[[macro]]\nkeys = \"ctrl+alt+kp1\"\nrun = \"true\"\nslot = 2").is_err());
     }
 }

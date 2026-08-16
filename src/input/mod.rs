@@ -1,6 +1,7 @@
 //! Input device discovery, grabbing, async readers and the uinput passthrough sink.
 
 pub mod hotkey;
+pub mod keys;
 
 use std::path::PathBuf;
 
@@ -55,7 +56,7 @@ pub fn discover(explicit: &Option<Vec<PathBuf>>) -> Result<Vec<(PathBuf, Device)
     Ok(found)
 }
 
-fn is_keyboard(dev: &Device) -> bool {
+pub fn is_keyboard(dev: &Device) -> bool {
     dev.supported_keys()
         .map(|keys| keys.contains(KeyCode::KEY_A))
         .unwrap_or(false)

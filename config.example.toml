@@ -123,3 +123,33 @@ slot = 2
 # name = "back to the hub"
 # run  = ["/home/admin/bin/desk-local.sh"]
 # timeout_secs = 30
+
+# Macros: run a command when a key combo is pressed, on ANY slot — the combo is
+# swallowed (trigger, repeats and the modifiers' releases never reach a target)
+# and only the command runs, on the hub. Same `run` forms, timeout, logging and
+# fire-and-forget contract as hooks above.
+#
+#   - keys: '+'-separated, case-insensitive. Modifiers ctrl, alt, shift, super
+#     (either side counts) plus exactly ONE other key, named as its evdev
+#     constant without KEY_, lowercased: kp1, f13, a, 1, pause, prog1, mute …
+#     `km-hub macro capture` prints the name of whatever you press.
+#   - Modifiers match EXACTLY: "ctrl+alt+kp1" does not fire while Shift is also
+#     down, so "ctrl+alt+kp1" and "ctrl+alt+shift+kp1" can be two macros.
+#   - Fires on the press only; holding the key does not repeat it.
+#   - Ctrl+Alt+F1..F12 (with any extra modifier) switch slots and cannot be
+#     macros; binding the same combo twice is an error at startup.
+#   - A key with no modifier is allowed (dedicated macro keys) but is then
+#     taken on every target — km-hub warns at startup.
+#   - Nothing is passed to the command; one macro is one command.
+#   - `km-hub macro add` captures a combo, asks for the command and writes the
+#     entry here (comments kept). Restart km-hub afterwards.
+#
+# [[macro]]
+# keys = "ctrl+alt+kp1"
+# name = "desk lamp"                     # optional, only used in log lines
+# run  = "curl -fsS -XPOST http://ha.local:8123/api/webhook/km-lamp"
+#
+# [[macro]]
+# keys = "ctrl+alt+shift+kp1"
+# run  = ["/home/admin/bin/lamp.sh", "off"]
+# timeout_secs = 30

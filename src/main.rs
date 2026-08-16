@@ -3,6 +3,7 @@ mod config;
 mod hid;
 mod hooks;
 mod input;
+mod macro_cli;
 mod rgb;
 mod router;
 mod state;
@@ -26,7 +27,13 @@ struct Args {
     transport: TransportKind,
 }
 
-fn parse_args() -> Result<Args> {
+/// What the process was asked to do: run the hub, or one of the `macro` tools.
+enum Invocation {
+    Run(Args),
+    Macro(Vec<String>),
+}
+
+fn parse_args() -> Result<Invocation> {
     let mut config = PathBuf::from("config.toml");
     let mut transport = TransportKind::Log;
     let mut it = std::env::args().skip(1);
@@ -41,21 +48,33 @@ fn parse_args() -> Result<Args> {
                 Some("le") => transport = TransportKind::Le,
                 other => bail!("--transport must be 'log', 'l2cap' or 'le', got {other:?}"),
             },
+            // `km-hub macro …` is a separate tool sharing the binary; it takes
+            // its own flags, so hand it everything that follows (plus a
+            // --config given before it, so both orders work).
+            "macro" => {
+                let mut rest = vec!["--config".to_string(), config.display().to_string()];
+                rest.extend(it);
+                return Ok(Invocation::Macro(rest));
+            }
             "--help" | "-h" => {
                 println!(
                     "usage: km-hub [--config <path>] [--transport log|l2cap|le]\n\
+                     \x20      km-hub macro capture|add [--config <path>]\n\
                      \n\
                      --config     config file (default: ./config.toml, see config.example.toml)\n\
                      --transport  'log' prints HID frames instead of sending (default),\n\
                      \x20            'l2cap' streams over classic Bluetooth HID sockets,\n\
-                     \x20            'le' serves HID over GATT as a Bluetooth LE peripheral"
+                     \x20            'le' serves HID over GATT as a Bluetooth LE peripheral\n\
+                     \n\
+                     macro capture  print the name of the next key combo you press\n\
+                     macro add      capture a combo and write a [[macro]] entry into the config"
                 );
                 std::process::exit(0);
             }
             other => bail!("unknown argument '{other}' (see --help)"),
         }
     }
-    Ok(Args { config, transport })
+    Ok(Invocation::Run(Args { config, transport }))
 }
 
 /// Fail early with actionable messages instead of confusing errors later.
@@ -79,7 +98,10 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
-    let args = parse_args()?;
+    let args = match parse_args()? {
+        Invocation::Run(args) => args,
+        Invocation::Macro(rest) => return macro_cli::run(rest).await,
+    };
     let settings = Settings::load(&args.config)?;
     let state_path = args
         .config
@@ -129,14 +151,15 @@ async fn main() -> Result<()> {
         (None, None, None)
     };
 
-    // Hooks are opt-in the same way: with no [[hook]] entries the task never
-    // starts and the router has nobody to notify.
-    let (hook_tx, hook_handle) = if settings.hooks.is_empty() {
+    // Hooks and macros are opt-in the same way: with no [[hook]] or [[macro]]
+    // entries the task never starts and the router has nobody to notify.
+    let (hook_tx, hook_handle) = if settings.hooks.is_empty() && settings.macros.is_empty() {
         (None, None)
     } else {
-        let (tx, event_rx) = mpsc::channel::<u8>(8);
+        let (tx, event_rx) = mpsc::channel::<hooks::HookEvent>(8);
         let handle = tokio::spawn(hooks::run(hooks::HookDeps {
             hooks: settings.hooks.clone(),
+            macros: settings.macros.clone(),
             event_rx,
             cancel: cancel.clone(),
         }));
@@ -149,6 +172,7 @@ async fn main() -> Result<()> {
         bt_cmd_tx: cmd_tx,
         slot_tx,
         hook_tx,
+        macros: settings.macros.iter().map(|m| m.combo).collect(),
         activity,
         // Cloned: the Bluetooth task keeps the original for pairing and bind
         // events, the router uses its copy to ask for a repaint.
@@ -157,6 +181,7 @@ async fn main() -> Result<()> {
         mouse_rate_hz: settings.mouse_rate_hz,
     });
     let router_handle = tokio::spawn(router.run(router_rx, cancel.clone()));
+    let macro_count = settings.macros.len();
     let deps = bt::BtDeps {
         settings,
         kind: args.transport,
@@ -188,6 +213,9 @@ async fn main() -> Result<()> {
          (unbound: opens a pairing window), add Shift to also run the slot's \
          hooks, Ctrl-C to quit"
     );
+    if macro_count > 0 {
+        info!(macros = macro_count, "macro combos armed on every slot");
+    }
     // Exiting non-zero lets the supervisor restart us once BlueZ is ready.
     let bt_died = tokio::select! {
         res = tokio::signal::ctrl_c() => {
