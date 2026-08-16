@@ -1,0 +1,30 @@
+[package]
+name = "km-hub"
+version = "0.1.0"
+edition = "2024"
+description = "Software KVM: forwards USB keyboard/mouse from a Raspberry Pi to multiple hosts as a Bluetooth HID device, switching with a hotkey."
+license = "MIT"
+
+[dependencies]
+# "process" is for the hook runner (src/hooks.rs), which spawns user commands
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "io-util", "net", "process"] }
+tokio-util = "0.7"
+evdev = { version = "0.13", features = ["tokio"] }
+# default features are EMPTY — bluetoothd (D-Bus API), l2cap (HID sockets),
+# rfcomm (hosts the ProfileManager1 registration API used for the SDP record)
+bluer = { version = "0.17", features = ["bluetoothd", "l2cap", "rfcomm"] }
+futures = "0.3"
+# already pulled in by bluer; used directly to read Device1.Bonded, which bluer 0.17 lacks.
+# "vendored" compiles libdbus-1 from source into the binary so the aarch64 cross-build
+# (see .cargo/config.toml) needs no arm64 libdbus-1-dev/pkg-config sysroot on the host.
+dbus = { version = "0.9", features = ["vendored"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

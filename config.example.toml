@@ -1,0 +1,125 @@
+# km-hub configuration. Copy to config.toml and adjust.
+
+# Friendly name advertised over Bluetooth. The adapter is only discoverable
+# while a pairing window is open (see below), not permanently.
+adapter_alias = "KMHub"
+
+# Max mouse *motion* report rate over Bluetooth, in Hz (default 125). Gaming
+# mice poll at 500-1000 Hz; forwarding every packet floods the BT link and
+# shows up as cursor lag. Buttons and keys are never delayed by this.
+# mouse_rate_hz = 125
+
+# Input devices to manage. Omit for auto-detection of all keyboards/mice
+# (km-hub's own virtual passthrough devices are always excluded).
+# devices = ["/dev/input/by-id/usb-Logitech_USB_Keyboard-event-kbd"]
+
+# Slot lighting: the hub's own keyboard/mouse show a color per slot, so the
+# active target is visible on the desk. Needs an OpenRGB server on the hub
+# (./setup.sh installs it); without this table, lighting is off entirely.
+#
+# Lighting is cosmetic only — a stopped or missing OpenRGB server never delays
+# or blocks switching, it just leaves the LEDs alone.
+#
+# If a device ever takes half a color update and leaves the keyboard two-tone,
+# press the slot's combo again: pressing Ctrl+Alt+F<n> for the slot you are
+# already on re-reads the devices and repaints everything from scratch.
+[rgb]
+enabled = true
+# server = "127.0.0.1:6742"    # OpenRGB SDK server
+brightness = 60                # 0-100, mapped onto each device's own range;
+                               # devices without a brightness control (most
+                               # mice) ignore it and run at their own level
+local_color   = "#ffffff"      # slot 1, the hub itself
+pairing_color = "#ffa000"      # blinks at 1 Hz while a pairing window is open
+bound_color   = "#00ff00"      # flashes twice when a device binds to a slot
+# Seconds without a keypress or mouse movement before the LEDs fade out, so an
+# empty desk is not lit all night. Any input fades them straight back to the
+# slot color. Nothing else about km-hub idles — switching, hooks and the
+# Bluetooth links are untouched. Set to 0 to keep the LEDs lit forever.
+# idle_timeout_secs = 120
+# Colors for slots without a [[target]] color below, starting at slot 2 and
+# wrapping: slot 2 red, slot 3 blue, slot 4 green, ...
+palette = ["#ff0000", "#0000ff", "#00ff00", "#ff00ff", "#00ffff", "#ff8000"]
+
+# Routing slots. Slot 1 is always the local host (Ctrl+Alt+F1); slots 2-12
+# switch to remote clients via Ctrl+Alt+F<n>.
+#
+# No configuration is required to add a client: press Ctrl+Alt+F<n> on an
+# UNBOUND slot to open a 60-second pairing window (adapter becomes
+# discoverable), then PAIR from the new device (confirm the passkey) — a plain
+# "Connect" pairs without storing a key and the client will refuse our HID
+# input; km-hub drops such links and asks you to pair. The binding is
+# remembered in state.toml next to this file. Press the combo again to switch.
+#
+# HOLD a slot's combo for 3 seconds to force it to re-pair: the binding is
+# dropped, the pairing is removed from BlueZ and a fresh window opens. Forget
+# the hub on the client too, or it will try to reconnect with a stale key.
+#
+# [[target]] entries are optional and serve three purposes:
+#   - pre-name a slot (name only): the given name is used when it later binds
+#   - pre-seed a slot (name + mac): binds without pairing-window discovery;
+#     overrides any learned binding in state.toml for that slot
+#   - give the slot its own lighting (color / brightness), overriding the
+#     [rgb] palette above
+#
+# Caveats for macOS / iOS clients:
+# - Use --transport le (HID over GATT): Apple hosts poll a classic-HID slave
+#   only every 30-50 ms and the pointer lags; over LE they hold an 11.25-15 ms
+#   connection interval. Hosts paired over classic HID must forget the hub and
+#   pair again over LE.
+# - Pairing auto-confirms (numeric comparison); passkey *entry* — typing digits
+#   on the hub's keyboard — is not implemented.
+# - Run ./setup.sh once: it frees BlueZ's HID PSMs (-P input), grants
+#   /dev/input + /dev/uinput access, sets the adapter class to keyboard/mouse
+#   combo (0x0005C0), installs the link tuning unit and, for LE, can make the
+#   controller LE-only so macOS cannot pair the classic side by mistake.
+
+[[target]]
+name = "macbook"
+slot = 2
+# mac = "AA:BB:CC:DD:EE:FF"   # optional pre-seed; omit to bind via pairing window
+# color = "#0000ff"           # optional; defaults to the [rgb] palette entry
+# brightness = 80             # optional; defaults to [rgb] brightness
+
+# Hooks: run a command when a slot is activated with Ctrl+Alt+SHIFT+F<n>.
+# km-hub only spawns the command — what it does (a webhook, a scene, a script,
+# a desk lamp) is entirely up to you.
+#
+#   - Runs ONLY on Ctrl+Alt+Shift+F<n>, which also switches to that slot. Plain
+#     Ctrl+Alt+F<n> switches silently and runs nothing, so you can go look at
+#     another machine without dragging the side effects along.
+#   - Pressing the Shift combo for the slot you are already on is a re-assert:
+#     no switch happens, but the hooks run again, so a side effect that didn't
+#     take (an IR command the HDMI switch missed) can be retried. Write hooks
+#     that are safe to run twice. There is no "deactivated" counterpart; to
+#     undo something, hook the slot you switch back to. (Either combo pressed
+#     for the current slot also repaints the lighting — see [rgb] above.)
+#   - An UNBOUND slot opens a pairing window instead of switching, and runs no
+#     hooks — nothing was activated.
+#   - Nothing is passed to the command. One hook belongs to one slot, so the
+#     hook itself is the identifier — no arguments, no environment to read.
+#   - A STRING runs through `sh -c`, so $VARS, pipes and redirection work.
+#     An ARRAY is exec'd directly with no shell, so "$HOME" stays a literal
+#     "$HOME" and nothing needs quoting. Pick per hook.
+#   - Secrets come from the environment km-hub itself runs in, not from here:
+#     add Environment= / EnvironmentFile= to km-hub.service (the service runs
+#     as the 'admin' user, so a hook does too).
+#   - Whatever the command prints goes to the km-hub log (journalctl -u km-hub).
+#   - A hook that fails, is missing, or runs long is logged and nothing more —
+#     it can never delay or block a switch. Overrunning timeout_secs (default
+#     10, max 300) kills it.
+#   - Several hooks may share a slot; they run concurrently.
+#   - This file is read once at startup: after editing hooks, restart km-hub.
+#
+# Slots are 1-12 here — unlike [[target]], slot 1 (the hub itself) is hookable.
+#
+# [[hook]]
+# slot = 2
+# name = "macbook on"                    # optional, only used in log lines
+# run  = "curl -fsS -XPOST -H \"Authorization: Bearer $HA_TOKEN\" http://ha.local:8123/api/webhook/km-macbook"
+#
+# [[hook]]
+# slot = 1
+# name = "back to the hub"
+# run  = ["/home/admin/bin/desk-local.sh"]
+# timeout_secs = 30

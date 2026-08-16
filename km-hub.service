@@ -1,0 +1,41 @@
+[Unit]
+Description=km-hub keyboard/mouse Bluetooth switcher
+After=bluetooth.service km-hub-linktune.service
+Requires=bluetooth.service
+# The link tuning (LE connection/advertising intervals, sniff parameters) must
+# be in place before the advertisement is registered.
+Wants=km-hub-linktune.service
+# bluetoothd being "started" does not mean its adapter is usable yet. km-hub
+# exits if the Bluetooth side fails, so it must be allowed to keep retrying
+# instead of tripping systemd's default 5-starts-in-10s limit and giving up.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=admin
+Group=input
+# Keep SNIFF in the adapter's default link policy. This line used to drop it, on
+# the theory that a host serving us only at sniff anchor points is what caused
+# the stuttering pointer. It is the other way round: an active link is
+# best-effort and is the first thing starved when the host's radio gets busy,
+# while a sniff link holds a reservation — provided the interval is tuned for a
+# pointer rather than left at the kernel's 50-500 ms defaults (see setup.sh step
+# 3b, which owns idle_timeout and the sniff intervals). Restated here because a
+# km-hub restart would otherwise clobber what that unit set at boot.
+# '+' runs this as root even though the service itself runs as admin; '-'
+# ignores the failure — an LE-only controller (ControllerMode = le) has no
+# link policy to set and answers "Operation not supported".
+ExecStartPre=-+/usr/bin/hciconfig hci0 lp rswitch,sniff
+WorkingDirectory=/home/admin/km-hub
+ExecStart=/home/admin/km-hub/km-hub --config config.toml --transport le
+Environment=RUST_LOG=km_hub=info
+# Secrets for [[hook]] commands (HA_URL, HA_TOKEN). Kept out of the repo — this
+# unit is in git and `make sync` would otherwise carry the token around. The
+# leading '-' makes a missing file non-fatal, so hooks are simply unconfigured.
+EnvironmentFile=-/home/admin/km-hub.env
+Restart=on-failure
+RestartSec=2
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

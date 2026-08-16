@@ -1,0 +1,19 @@
+# Rust
+/target/
+
+# Local machine state — never commit
+config.toml
+state.toml
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Captures and scratch
+*.btsnoop
+*.log
+
+# Local machine parameters for the Makefile (see .env.example)
+.env
