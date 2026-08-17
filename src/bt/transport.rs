@@ -113,6 +113,23 @@ impl Transport {
         }
     }
 
+    /// Re-register the LE GATT application (see `LeTransport::reregister`);
+    /// nothing to do on the other variants.
+    pub async fn reregister_le(&mut self) -> Result<()> {
+        match self {
+            Transport::Le(t) => t.reregister().await,
+            _ => Ok(()),
+        }
+    }
+
+    /// Tear the transport down in the order the hosts can live with (see
+    /// `LeTransport::shutdown`). The other variants have nothing to do.
+    pub async fn shutdown(self) {
+        if let Transport::Le(t) = self {
+            t.shutdown().await;
+        }
+    }
+
     /// Wait for an incoming HID connection (control then interrupt) and
     /// return the peer's address. Cancel-safe: an accepted control channel is
     /// parked until its interrupt channel arrives on a later call.

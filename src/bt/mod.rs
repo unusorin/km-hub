@@ -6,7 +6,7 @@ pub mod gatt;
 pub mod sdp;
 pub mod transport;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -114,6 +114,14 @@ struct Manager {
     bindings_tx: watch::Sender<Bindings>,
     state_path: PathBuf,
     pairing: Option<PairingWindow>,
+    /// Bound hosts seen connected without an input-report session, and since
+    /// when (see `poll_stuck_hosts`).
+    stuck: HashMap<Address, Instant>,
+    /// Hosts already served by a re-registration during their current
+    /// connection; forgotten when they disconnect. Bounds the churn to one
+    /// re-registration per host connection.
+    helped: HashSet<Address>,
+    last_reregister: Option<Instant>,
     rgb_tx: Option<mpsc::Sender<RgbEvent>>,
     /// The LE advertisement (LE mode only). Always registered while running:
     /// connectable so bonded hosts can reconnect, discoverable only while a
@@ -121,6 +129,13 @@ struct Manager {
     /// reads an advertisement's properties once.
     adv: Option<AdvertisementHandle>,
 }
+
+/// A bound host connected this long without any input-report session is
+/// taken to be stuck behind bluetoothd's remembered CCC state. Reconnecting
+/// hosts subscribe well inside a second; a full rediscovery took ~1.5 s.
+const STUCK_HOST_GRACE: Duration = Duration::from_secs(3);
+/// Minimum spacing between two GATT re-registrations.
+const REREGISTER_COOLDOWN: Duration = Duration::from_secs(10);
 
 /// bluer unregisters a dropped advertisement from a spawned task; give it a
 /// moment before registering the replacement or the two overlap.
@@ -220,6 +235,9 @@ pub async fn run(deps: BtDeps) -> Result<()> {
         bindings_tx,
         state_path,
         pairing: None,
+        stuck: HashMap::new(),
+        helped: HashSet::new(),
+        last_reregister: None,
         rgb_tx,
         adv: None,
     };
@@ -315,7 +333,10 @@ pub async fn run(deps: BtDeps) -> Result<()> {
                 Some(cmd) => mgr.handle_cmd(cmd).await,
                 None => break,
             },
-            _ = poll.tick() => mgr.poll_window().await,
+            _ = poll.tick() => {
+                mgr.poll_window().await;
+                mgr.poll_stuck_hosts(&mut transport).await;
+            }
             _ = slot_rx.changed() => {}
             req = profile_request => log_connect_request(req),
         }
@@ -323,8 +344,10 @@ pub async fn run(deps: BtDeps) -> Result<()> {
 
     mgr.close_window().await;
     // Dropping the handle unregisters the advertisement; no re-advertising on
-    // the way out.
+    // the way out. Do this before dropping the hosts so none reconnects into
+    // a GATT application that is about to disappear.
     mgr.adv.take();
+    transport.shutdown().await;
     info!("bluetooth manager stopped");
     Ok(())
 }
@@ -506,6 +529,69 @@ impl Manager {
 
     /// Once per second while a window is open: bind the first newly paired
     /// device, or time the window out.
+    /// Once a second: a bound host that bluetoothd shows connected, yet has
+    /// had no input-report session for `STUCK_HOST_GRACE`, is a host whose
+    /// notification re-enable bluetoothd swallowed (its CCC state survived
+    /// the disconnect). Re-registering the GATT application is the only way
+    /// to shake that loose; it costs every connected host a Service Changed
+    /// round trip, so do it once per host connection and not back to back.
+    async fn poll_stuck_hosts(&mut self, transport: &mut Transport) {
+        if self.kind != TransportKind::Le {
+            return;
+        }
+        let now = Instant::now();
+        let mut trigger = None;
+        for b in self.bindings.values() {
+            let addr = b.addr;
+            let connected = match self.adapter.device(addr) {
+                Ok(dev) => dev.is_connected().await.unwrap_or(false),
+                Err(_) => false,
+            };
+            if !connected {
+                self.stuck.remove(&addr);
+                self.helped.remove(&addr);
+                continue;
+            }
+            if transport.is_peer_connected(addr) {
+                self.stuck.remove(&addr);
+                continue;
+            }
+            if self.helped.contains(&addr) {
+                continue;
+            }
+            let since = *self.stuck.entry(addr).or_insert(now);
+            if now.duration_since(since) >= STUCK_HOST_GRACE {
+                trigger = Some((addr, b.name.clone()));
+                break;
+            }
+        }
+        let Some((addr, name)) = trigger else { return };
+        if self
+            .last_reregister
+            .is_some_and(|t| now.duration_since(t) < REREGISTER_COOLDOWN)
+        {
+            return;
+        }
+        warn!(
+            %addr, %name,
+            "host connected but not subscribed to input reports (bluetoothd kept its \
+             pre-disconnect CCC state); re-registering the HID application"
+        );
+        match transport.reregister_le().await {
+            Ok(()) => {
+                self.last_reregister = Some(now);
+                self.stuck.clear();
+                // Every host with a live link gets the same reset; count them
+                // all as served so a host that ignores Service Changed does
+                // not keep us re-registering.
+                for b in self.bindings.values() {
+                    self.helped.insert(b.addr);
+                }
+            }
+            Err(err) => warn!(err = format!("{err:#}"), "re-registering the HID application failed"),
+        }
+    }
+
     async fn poll_window(&mut self) {
         let Some(window) = &self.pairing else { return };
         let (slot, deadline, bound) = (window.slot, window.deadline, window.bound);

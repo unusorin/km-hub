@@ -217,10 +217,19 @@ async fn main() -> Result<()> {
         info!(macros = macro_count, "macro combos armed on every slot");
     }
     // Exiting non-zero lets the supervisor restart us once BlueZ is ready.
+    // systemd stops us with SIGTERM: without a handler the process just dies
+    // and bluetoothd unregisters the GATT application under the connected
+    // hosts (see `LeTransport::shutdown` for why that matters).
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing SIGTERM handler")?;
     let bt_died = tokio::select! {
         res = tokio::signal::ctrl_c() => {
             res?;
             info!("shutting down");
+            false
+        }
+        _ = sigterm.recv() => {
+            info!("shutting down (SIGTERM)");
             false
         }
         _ = bt_done_rx => {
@@ -258,7 +267,9 @@ async fn main() -> Result<()> {
             }
         }
     };
-    if tokio::time::timeout(Duration::from_secs(3), shutdown).await.is_err() {
+    // Long enough for the Bluetooth manager to disconnect its hosts first
+    // (bluetoothd takes 2 s+ per Disconnect, see `LeTransport::shutdown`).
+    if tokio::time::timeout(Duration::from_secs(6), shutdown).await.is_err() {
         warn!("shutdown timed out, exiting anyway");
     }
     if bt_died {

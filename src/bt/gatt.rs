@@ -329,11 +329,60 @@ struct Peer {
     last_mouse_buttons: u8,
 }
 
+/// Register the HID application and tag every characteristic's control
+/// stream with its report id.
+async fn register(adapter: &Adapter) -> Result<(ApplicationHandle, TaggedEvents)> {
+    let (app, controls) = build_hid_application();
+    let handle = adapter
+        .serve_gatt_application(app)
+        .await
+        .context("HID GATT application registration failed")?;
+    info!("HID GATT application registered (HID, Battery, Device Information services)");
+    let events = select_all(
+        controls
+            .into_iter()
+            .map(|(id, control)| control.map(move |ev| (id, ev)).boxed()),
+    );
+    Ok((handle, events))
+}
+
+/// Poll the adapter's local service list until the HID service is (`present`
+/// = true) or is not there; false on timeout. bluer unregisters an application
+/// from a spawned task, so a dropped handle is not yet gone.
+async fn wait_hid_service(adapter: &Adapter, present: bool) -> bool {
+    let hid = Uuid::from_u16(SVC_HID);
+    let deadline = tokio::time::Instant::now() + REREGISTER_WAIT;
+    loop {
+        let has = adapter
+            .uuids()
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|set| set.contains(&hid));
+        if has == present {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Upper bound on waiting for bluetoothd to drop the old application.
+const REREGISTER_WAIT: Duration = Duration::from_secs(2);
+
+/// How long `LeTransport::shutdown` waits for one host to drop its link.
+/// bluetoothd's Device1.Disconnect first lets the profiles disconnect and only
+/// forces the ACL down after a fixed 2 s timer (device.c DISCONNECT_TIMER), so
+/// the reply never comes sooner than that.
+const SHUTDOWN_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+
 /// Holds one GATT application and one set of writers per subscribed host, so
 /// frames are routed by peer address like the L2CAP transport.
 pub struct LeTransport {
     adapter: Adapter,
-    _app: ApplicationHandle,
+    app: Option<ApplicationHandle>,
     events: TaggedEvents,
     /// False once `events` ends (application unregistered) so the Manager
     /// stops selecting on `accept_incoming`.
@@ -347,21 +396,11 @@ pub struct LeTransport {
 impl LeTransport {
     /// Register the HID GATT application on `adapter`.
     pub async fn serve(adapter: Adapter) -> Result<Self> {
-        let (app, controls) = build_hid_application();
-        let app_handle = adapter
-            .serve_gatt_application(app)
-            .await
-            .context("HID GATT application registration failed")?;
-        info!("HID GATT application registered (HID, Battery, Device Information services)");
-        let events = select_all(
-            controls
-                .into_iter()
-                .map(|(id, control)| control.map(move |ev| (id, ev)).boxed()),
-        );
+        let (app, events) = register(&adapter).await?;
         let (closed_tx, closed_rx) = mpsc::unbounded_channel();
         Ok(Self {
             adapter,
-            _app: app_handle,
+            app: Some(app),
             events,
             listening: true,
             closed_tx,
@@ -369,6 +408,40 @@ impl LeTransport {
             next_generation: 0,
             peers: HashMap::new(),
         })
+    }
+
+    /// Replace the GATT application with a fresh copy of itself.
+    ///
+    /// bluetoothd remembers a *bonded* host's CCC ("notifications on") across
+    /// disconnects and answers the host's re-enable on reconnect with "no
+    /// change" — without ever calling AcquireNotify again (gatt-database.c:
+    /// `if (val == ccc->value) goto done;`, and `att_disconnected` keeps the
+    /// state for bonded devices). The host then sits connected, HID attached,
+    /// and hears nothing from us. The one thing that clears that state short
+    /// of restarting bluetoothd is removing the service (`remove_device_ccc`).
+    ///
+    /// Order matters: unregister the old application, wait until its services
+    /// are really gone, and only then register the new one. A BlueZ host
+    /// (device.c) skips probing a service whose UUID it already has a profile
+    /// for, and on removal keeps the profile as long as *another* service
+    /// with that UUID exists — so "add new, then drop old" leaves its HID
+    /// profile bound to dead handles for good. Remove-then-add makes it drop
+    /// HoG with the last HID service and re-probe it on the new one; that
+    /// costs every connected host two Service Changed round trips and a
+    /// moment without HID, which is why the caller does this sparingly.
+    pub async fn reregister(&mut self) -> Result<()> {
+        // Old sessions die with the old attributes; the watchers report them
+        // and `forget_sub` clears the peers.
+        self.app.take();
+        self.events = SelectAll::new();
+        if !wait_hid_service(&self.adapter, false).await {
+            warn!("old HID application still registered after {REREGISTER_WAIT:?}; registering anyway");
+        }
+        let (app, events) = register(&self.adapter).await?;
+        self.app = Some(app);
+        self.events = events;
+        self.listening = true;
+        Ok(())
     }
 
     pub fn has_listeners(&self) -> bool {
@@ -488,6 +561,43 @@ impl LeTransport {
             }
         }
         Ok(())
+    }
+
+    /// Disconnect every LE host and only then let the GATT application go.
+    ///
+    /// Dropping the application while a host is still connected makes
+    /// bluetoothd send it *Service Changed*; a BlueZ host then rediscovers,
+    /// finds only bluetoothd's own GAP/GATT/DeviceInfo services and rewrites
+    /// its stored record without HID — and a device without an HID profile is
+    /// never put on the kernel's auto-connect list, so after the next reboot
+    /// (either side) it never comes back on its own. Cutting the link first
+    /// leaves the host's cache intact; it reconnects as soon as we advertise
+    /// again, with the application registered ahead of the advertisement.
+    pub async fn shutdown(self) {
+        let peers: Vec<Address> = match self.adapter.device_addresses().await {
+            Ok(addrs) => addrs,
+            Err(err) => {
+                warn!(%err, "cannot list devices; unregistering HID application with hosts attached");
+                return;
+            }
+        };
+        let disconnects = peers.into_iter().filter_map(|peer| {
+            let dev = self.adapter.device(peer).ok()?;
+            Some(async move {
+                if !dev.is_connected().await.unwrap_or(false) {
+                    return;
+                }
+                info!(%peer, "disconnecting host before unregistering the HID application");
+                // BlueZ replies to Disconnect once the link is actually down.
+                match tokio::time::timeout(SHUTDOWN_DISCONNECT_TIMEOUT, dev.disconnect()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => debug!(%peer, %err, "disconnect failed"),
+                    Err(_) => warn!(%peer, "disconnect timed out"),
+                }
+            })
+        });
+        futures::future::join_all(disconnects).await;
+        // `self` (and with it `app`) drops here, after the links are gone.
     }
 
     /// Forget every subscription of `peer` and ask BlueZ to disconnect it.
