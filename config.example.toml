@@ -4,10 +4,13 @@
 # while a pairing window is open (see below), not permanently.
 adapter_alias = "KMHub"
 
-# Max mouse *motion* report rate over Bluetooth, in Hz (default 125). Gaming
+# Max mouse *motion* report rate over Bluetooth, in Hz (default 60). Gaming
 # mice poll at 500-1000 Hz; forwarding every packet floods the BT link and
 # shows up as cursor lag. Buttons and keys are never delayed by this.
-# mouse_rate_hz = 125
+# Over LE the host picks a 11.25-15 ms connection interval (~65-90
+# notifications/s) and bluetoothd queues without limit, so anything above the
+# host's service rate only piles up as seconds of lag. 60 leaves headroom.
+# mouse_rate_hz = 60
 
 # Input devices to manage. Omit for auto-detection of all keyboards/mice
 # (km-hub's own virtual passthrough devices are always excluded).

@@ -127,10 +127,11 @@ struct Manager {
     helped: HashSet<Address>,
     last_reregister: Option<Instant>,
     rgb_tx: Option<mpsc::Sender<RgbEvent>>,
-    /// The LE advertisement (LE mode only). Always registered while running:
-    /// connectable so bonded hosts can reconnect, discoverable only while a
-    /// pairing window is open. Re-registered to flip that flag, since BlueZ
-    /// reads an advertisement's properties once.
+    /// The LE advertisement (LE mode only): connectable so bonded hosts can
+    /// reconnect, discoverable only while a pairing window is open, and
+    /// dropped while every bound host is connected (`poll_advertising`).
+    /// Re-registered to flip the discoverable flag, since BlueZ reads an
+    /// advertisement's properties once.
     adv: Option<AdvertisementHandle>,
 }
 
@@ -256,7 +257,8 @@ pub async fn run(deps: BtDeps) -> Result<()> {
     }
     if kind == TransportKind::Le {
         // Hosts connect to us on LE: advertise from the start (connectable,
-        // not discoverable) so bonded ones can come back on their own.
+        // not discoverable) so bonded ones can come back on their own; the
+        // poll turns it off once they all have (see `poll_advertising`).
         mgr.set_advertising(false).await?;
     }
 
@@ -345,7 +347,9 @@ pub async fn run(deps: BtDeps) -> Result<()> {
             },
             _ = poll.tick() => {
                 mgr.poll_window().await;
-                mgr.poll_stuck_hosts(&mut transport).await;
+                let connected = mgr.connected_hosts().await;
+                mgr.poll_advertising(&connected).await;
+                mgr.poll_stuck_hosts(&mut transport, &connected).await;
             }
             _ = slot_rx.changed() => {}
             req = profile_request => log_connect_request(req),
@@ -537,6 +541,43 @@ impl Manager {
         }
     }
 
+    /// Bound hosts bluetoothd currently shows connected.
+    async fn connected_hosts(&self) -> HashSet<Address> {
+        let mut out = HashSet::new();
+        for b in self.bindings.values() {
+            if let Ok(dev) = self.adapter.device(b.addr)
+                && dev.is_connected().await.unwrap_or(false)
+            {
+                out.insert(b.addr);
+            }
+        }
+        out
+    }
+
+    /// Once a second, outside a pairing window (which owns the advertisement
+    /// while open): advertise only while some bound host is away. Bonded
+    /// hosts reconnect on their own the moment we advertise, so nothing is
+    /// lost, and while everyone is here the radio is not spending 100–150 ms
+    /// slots on advertising events between three connections' anchor points.
+    async fn poll_advertising(&mut self, connected: &HashSet<Address>) {
+        if self.kind != TransportKind::Le || self.pairing.is_some() {
+            return;
+        }
+        let all_here = self.bindings.values().all(|b| connected.contains(&b.addr));
+        match (all_here, self.adv.is_some()) {
+            (true, true) => {
+                self.adv.take();
+                info!("every bound host is connected; advertising off");
+            }
+            (false, false) => {
+                if let Err(err) = self.set_advertising(false).await {
+                    warn!(%err, "cannot resume advertising");
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Once a second: a bound host that bluetoothd shows connected, yet has
     /// had no input-report session for `STUCK_HOST_GRACE`, is either a host
     /// whose notification re-enable bluetoothd swallowed (its CCC state
@@ -553,7 +594,7 @@ impl Manager {
     ///    not re-attach its HID driver afterwards (it re-subscribes and then
     ///    ignores the reports until reconnected), so with other hosts live it
     ///    is not worth it: the host is left alone for this connection.
-    async fn poll_stuck_hosts(&mut self, transport: &mut Transport) {
+    async fn poll_stuck_hosts(&mut self, transport: &mut Transport, connected: &HashSet<Address>) {
         if self.kind != TransportKind::Le {
             return;
         }
@@ -563,11 +604,7 @@ impl Manager {
         let mut others_subscribed = false;
         for b in self.bindings.values() {
             let addr = b.addr;
-            let connected = match self.adapter.device(addr) {
-                Ok(dev) => dev.is_connected().await.unwrap_or(false),
-                Err(_) => false,
-            };
-            if !connected {
+            if !connected.contains(&addr) {
                 self.stuck.remove(&addr);
                 self.helped.remove(&addr);
                 continue;
@@ -587,14 +624,14 @@ impl Manager {
             }
         }
         let Some((addr, name)) = trigger else { return };
-        if !self.kicked.contains_key(&addr) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.kicked.entry(addr) {
             warn!(
                 %addr, %name,
                 "host connected but not subscribed to input reports; disconnecting it so it \
                  reconnects afresh"
             );
             transport.drop_peer(addr);
-            self.kicked.insert(addr, now);
+            e.insert(now);
             self.stuck.remove(&addr);
             return;
         }

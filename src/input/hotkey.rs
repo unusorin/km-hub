@@ -34,6 +34,12 @@ pub enum Verdict {
         /// Shift was held: also run the slot's hooks. One variant rather than
         /// two, so the router cannot forget to handle a flavour.
         fire_hooks: bool,
+        /// The modifier keys that formed the combo, as for `RunMacro`: their
+        /// presses already went to the current target and their releases will
+        /// be swallowed. A real switch releases everything on the target it
+        /// leaves; when nothing is left (same slot, unbound slot) the router
+        /// must release exactly these, or the host keeps Ctrl+Alt held.
+        held_mods: Vec<KeyCode>,
     },
     /// Run the macro at this index of the configured list; the triggering
     /// event is swallowed. `held_mods` are the modifier keys that formed the
@@ -81,13 +87,15 @@ impl HotkeyFsm {
                     let fire_hooks = self.any_held(&SHIFTS);
                     // Swallow the F-key and the combo modifiers until released.
                     self.suppressed.insert(key);
+                    let mut held_mods = Vec::new();
                     for m in CTRLS.iter().chain(ALTS.iter()).chain(SHIFTS.iter()) {
                         if self.held.contains(m) {
                             self.suppressed.insert(*m);
+                            held_mods.push(*m);
                         }
                     }
                     self.combo_held = Some((key, slot));
-                    return Verdict::SwitchTo { slot, fire_hooks };
+                    return Verdict::SwitchTo { slot, fire_hooks, held_mods };
                 }
                 if !self.macros.is_empty() {
                     let combo = KeyCombo { mods: Mods::from_held(&self.held), key };
@@ -166,14 +174,23 @@ fn fkey_slot(key: KeyCode) -> Option<u8> {
 mod tests {
     use super::*;
 
+    /// Slot and hooks flag of a `SwitchTo`, ignoring which modifiers formed
+    /// the combo; `None` for any other verdict.
+    fn switched(v: Verdict) -> Option<(u8, bool)> {
+        match v {
+            Verdict::SwitchTo { slot, fire_hooks, .. } => Some((slot, fire_hooks)),
+            _ => None,
+        }
+    }
+
     /// A plain switch: Ctrl+Alt+F<n> with no Shift.
-    fn switch(slot: u8) -> Verdict {
-        Verdict::SwitchTo { slot, fire_hooks: false }
+    fn switch(slot: u8) -> Option<(u8, bool)> {
+        Some((slot, false))
     }
 
     /// A switch that also runs the slot's hooks: Ctrl+Alt+Shift+F<n>.
-    fn switch_and_fire(slot: u8) -> Verdict {
-        Verdict::SwitchTo { slot, fire_hooks: true }
+    fn switch_and_fire(slot: u8) -> Option<(u8, bool)> {
+        Some((slot, true))
     }
 
     #[test]
@@ -199,7 +216,7 @@ mod tests {
         let mut fsm = HotkeyFsm::default();
         assert_eq!(fsm.on_key(KeyCode::KEY_LEFTCTRL, 1), Verdict::Pass);
         assert_eq!(fsm.on_key(KeyCode::KEY_LEFTALT, 1), Verdict::Pass);
-        assert_eq!(fsm.on_key(KeyCode::KEY_F2, 1), switch(2));
+        assert_eq!(switched(fsm.on_key(KeyCode::KEY_F2, 1)), switch(2));
         // Repeats and release of the F-key are swallowed.
         assert_eq!(fsm.on_key(KeyCode::KEY_F2, 2), Verdict::Swallow);
         assert_eq!(fsm.on_key(KeyCode::KEY_F2, 0), Verdict::Swallow);
@@ -216,10 +233,10 @@ mod tests {
         let mut fsm = HotkeyFsm::default();
         fsm.on_key(KeyCode::KEY_RIGHTCTRL, 1);
         fsm.on_key(KeyCode::KEY_RIGHTALT, 1);
-        assert_eq!(fsm.on_key(KeyCode::KEY_F2, 1), switch(2));
+        assert_eq!(switched(fsm.on_key(KeyCode::KEY_F2, 1)), switch(2));
         assert_eq!(fsm.on_key(KeyCode::KEY_F2, 0), Verdict::Swallow);
         // Modifiers still physically held: next F-key switches again.
-        assert_eq!(fsm.on_key(KeyCode::KEY_F1, 1), switch(1));
+        assert_eq!(switched(fsm.on_key(KeyCode::KEY_F1, 1)), switch(1));
         assert_eq!(fsm.on_key(KeyCode::KEY_F1, 0), Verdict::Swallow);
         assert_eq!(fsm.on_key(KeyCode::KEY_RIGHTALT, 0), Verdict::Swallow);
         assert_eq!(fsm.on_key(KeyCode::KEY_RIGHTCTRL, 0), Verdict::Swallow);
@@ -234,20 +251,20 @@ mod tests {
         let mut fsm = HotkeyFsm::default();
         fsm.on_key(KeyCode::KEY_LEFTCTRL, 1);
         fsm.on_key(KeyCode::KEY_LEFTALT, 1);
-        assert_eq!(fsm.on_key(KeyCode::KEY_F2, 1), switch(2));
+        assert_eq!(switched(fsm.on_key(KeyCode::KEY_F2, 1)), switch(2));
         // Leaning on the key must not spam the router.
         assert_eq!(fsm.on_key(KeyCode::KEY_F2, 2), Verdict::Swallow);
         assert_eq!(fsm.on_key(KeyCode::KEY_F2, 2), Verdict::Swallow);
         assert_eq!(fsm.on_key(KeyCode::KEY_F2, 0), Verdict::Swallow);
         // A fresh press of the same F-key does, with the modifiers still down.
-        assert_eq!(fsm.on_key(KeyCode::KEY_F2, 1), switch(2));
+        assert_eq!(switched(fsm.on_key(KeyCode::KEY_F2, 1)), switch(2));
         assert_eq!(fsm.on_key(KeyCode::KEY_F2, 0), Verdict::Swallow);
         // And again after fully releasing and re-forming the combo.
         assert_eq!(fsm.on_key(KeyCode::KEY_LEFTALT, 0), Verdict::Swallow);
         assert_eq!(fsm.on_key(KeyCode::KEY_LEFTCTRL, 0), Verdict::Swallow);
         fsm.on_key(KeyCode::KEY_LEFTCTRL, 1);
         fsm.on_key(KeyCode::KEY_LEFTALT, 1);
-        assert_eq!(fsm.on_key(KeyCode::KEY_F2, 1), switch(2));
+        assert_eq!(switched(fsm.on_key(KeyCode::KEY_F2, 1)), switch(2));
     }
 
     #[test]
@@ -256,7 +273,7 @@ mod tests {
         assert_eq!(fsm.combo_slot_held(), None);
         fsm.on_key(KeyCode::KEY_LEFTCTRL, 1);
         fsm.on_key(KeyCode::KEY_LEFTALT, 1);
-        assert_eq!(fsm.on_key(KeyCode::KEY_F4, 1), switch(4));
+        assert_eq!(switched(fsm.on_key(KeyCode::KEY_F4, 1)), switch(4));
         assert_eq!(fsm.combo_slot_held(), Some(4));
         // Auto-repeat while holding does not disturb it.
         fsm.on_key(KeyCode::KEY_F4, 2);
@@ -298,7 +315,7 @@ mod tests {
         fsm.on_key(KeyCode::KEY_LEFTCTRL, 1);
         fsm.on_key(KeyCode::KEY_LEFTALT, 1);
         assert_eq!(fsm.on_key(KeyCode::KEY_X, 1), Verdict::Pass);
-        assert_eq!(fsm.on_key(KeyCode::KEY_F3, 1), switch(3));
+        assert_eq!(switched(fsm.on_key(KeyCode::KEY_F3, 1)), switch(3));
         // Non-combo key keeps passing after the switch.
         assert_eq!(fsm.on_key(KeyCode::KEY_X, 0), Verdict::Pass);
     }
@@ -312,7 +329,7 @@ mod tests {
         assert_eq!(fsm.on_key(KeyCode::KEY_LEFTCTRL, 1), Verdict::Pass);
         assert_eq!(fsm.on_key(KeyCode::KEY_LEFTALT, 1), Verdict::Pass);
         assert_eq!(fsm.on_key(KeyCode::KEY_LEFTSHIFT, 1), Verdict::Pass);
-        assert_eq!(fsm.on_key(KeyCode::KEY_F3, 1), switch_and_fire(3));
+        assert_eq!(switched(fsm.on_key(KeyCode::KEY_F3, 1)), switch_and_fire(3));
         assert_eq!(fsm.on_key(KeyCode::KEY_F3, 0), Verdict::Swallow);
         assert_eq!(fsm.on_key(KeyCode::KEY_LEFTSHIFT, 0), Verdict::Swallow);
         assert_eq!(fsm.on_key(KeyCode::KEY_LEFTALT, 0), Verdict::Swallow);
@@ -330,7 +347,7 @@ mod tests {
         fsm.on_key(KeyCode::KEY_RIGHTCTRL, 1);
         fsm.on_key(KeyCode::KEY_RIGHTALT, 1);
         fsm.on_key(KeyCode::KEY_RIGHTSHIFT, 1);
-        assert_eq!(fsm.on_key(KeyCode::KEY_F5, 1), switch_and_fire(5));
+        assert_eq!(switched(fsm.on_key(KeyCode::KEY_F5, 1)), switch_and_fire(5));
         assert_eq!(fsm.on_key(KeyCode::KEY_RIGHTSHIFT, 0), Verdict::Swallow);
     }
 
@@ -342,15 +359,15 @@ mod tests {
         fsm.on_key(KeyCode::KEY_LEFTCTRL, 1);
         fsm.on_key(KeyCode::KEY_LEFTALT, 1);
         fsm.on_key(KeyCode::KEY_LEFTSHIFT, 1);
-        assert_eq!(fsm.on_key(KeyCode::KEY_F2, 1), switch_and_fire(2));
+        assert_eq!(switched(fsm.on_key(KeyCode::KEY_F2, 1)), switch_and_fire(2));
         assert_eq!(fsm.on_key(KeyCode::KEY_F2, 0), Verdict::Swallow);
         assert_eq!(fsm.on_key(KeyCode::KEY_LEFTSHIFT, 0), Verdict::Swallow);
         // Ctrl+Alt still down, Shift gone: a plain switch.
-        assert_eq!(fsm.on_key(KeyCode::KEY_F3, 1), switch(3));
+        assert_eq!(switched(fsm.on_key(KeyCode::KEY_F3, 1)), switch(3));
         // And picking Shift back up asks for the hooks again.
         fsm.on_key(KeyCode::KEY_F3, 0);
         fsm.on_key(KeyCode::KEY_LEFTSHIFT, 1);
-        assert_eq!(fsm.on_key(KeyCode::KEY_F4, 1), switch_and_fire(4));
+        assert_eq!(switched(fsm.on_key(KeyCode::KEY_F4, 1)), switch_and_fire(4));
     }
 
     /// Shift only means anything on top of the full combo; on its own it is a
@@ -376,7 +393,7 @@ mod tests {
         fsm.on_key(KeyCode::KEY_LEFTCTRL, 1);
         fsm.on_key(KeyCode::KEY_LEFTALT, 1);
         fsm.on_key(KeyCode::KEY_LEFTSHIFT, 1);
-        assert_eq!(fsm.on_key(KeyCode::KEY_F2, 1), switch_and_fire(2));
+        assert_eq!(switched(fsm.on_key(KeyCode::KEY_F2, 1)), switch_and_fire(2));
         assert_eq!(fsm.combo_slot_held(), Some(2));
         fsm.on_key(KeyCode::KEY_F2, 0);
         assert_eq!(fsm.combo_slot_held(), None);
@@ -389,6 +406,30 @@ mod tests {
     /// The macro verdict, with the modifiers the router has to release.
     fn run_macro(index: usize, held_mods: &[KeyCode]) -> Verdict {
         Verdict::RunMacro { index, held_mods: held_mods.to_vec() }
+    }
+
+    /// The switch verdict names the modifiers that formed the combo, so the
+    /// router can release them when no switch happens (re-assert of the
+    /// current slot, unbound slot) — the FSM swallows their releases.
+    #[test]
+    fn switch_reports_the_combo_modifiers() {
+        let mut fsm = HotkeyFsm::default();
+        assert_eq!(fsm.on_key(KeyCode::KEY_LEFTCTRL, 1), Verdict::Pass);
+        assert_eq!(fsm.on_key(KeyCode::KEY_RIGHTALT, 1), Verdict::Pass);
+        assert_eq!(fsm.on_key(KeyCode::KEY_LEFTSHIFT, 1), Verdict::Pass);
+        assert_eq!(
+            fsm.on_key(KeyCode::KEY_F2, 1),
+            Verdict::SwitchTo {
+                slot: 2,
+                fire_hooks: true,
+                held_mods: vec![KeyCode::KEY_LEFTCTRL, KeyCode::KEY_RIGHTALT, KeyCode::KEY_LEFTSHIFT],
+            }
+        );
+        // ...and their releases are indeed swallowed, hence the router's job.
+        assert_eq!(fsm.on_key(KeyCode::KEY_F2, 0), Verdict::Swallow);
+        assert_eq!(fsm.on_key(KeyCode::KEY_LEFTSHIFT, 0), Verdict::Swallow);
+        assert_eq!(fsm.on_key(KeyCode::KEY_RIGHTALT, 0), Verdict::Swallow);
+        assert_eq!(fsm.on_key(KeyCode::KEY_LEFTCTRL, 0), Verdict::Swallow);
     }
 
     #[test]
@@ -466,12 +507,12 @@ mod tests {
         let mut fsm = macro_fsm(&["ctrl+alt+kp1", "ctrl+alt+shift+a"]);
         fsm.on_key(KeyCode::KEY_LEFTCTRL, 1);
         fsm.on_key(KeyCode::KEY_LEFTALT, 1);
-        assert_eq!(fsm.on_key(KeyCode::KEY_F2, 1), switch(2));
+        assert_eq!(switched(fsm.on_key(KeyCode::KEY_F2, 1)), switch(2));
         assert_eq!(fsm.on_key(KeyCode::KEY_F2, 0), Verdict::Swallow);
         assert!(matches!(fsm.on_key(KeyCode::KEY_KP1, 1), Verdict::RunMacro { index: 0, .. }));
         fsm.on_key(KeyCode::KEY_KP1, 0);
         fsm.on_key(KeyCode::KEY_LEFTSHIFT, 1);
-        assert_eq!(fsm.on_key(KeyCode::KEY_F3, 1), switch_and_fire(3));
+        assert_eq!(switched(fsm.on_key(KeyCode::KEY_F3, 1)), switch_and_fire(3));
         assert!(matches!(fsm.on_key(KeyCode::KEY_A, 1), Verdict::RunMacro { index: 1, .. }));
         // Plain keys still pass with no macro configured for them.
         assert_eq!(fsm.on_key(KeyCode::KEY_X, 1), Verdict::Pass);

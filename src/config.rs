@@ -24,7 +24,9 @@ struct RawConfig {
     devices: Option<Vec<PathBuf>>,
     /// Max mouse *motion* report rate over Bluetooth (Hz). Buttons and keys
     /// are never delayed. Gaming mice poll at 500–1000 Hz, which floods a BT
-    /// link and shows up as cursor lag; BT mice normally report ~125 Hz.
+    /// link and shows up as cursor lag. Over LE the host's connection
+    /// interval (11.25–15 ms) caps delivery at ~65–90 reports/s and
+    /// bluetoothd queues the excess without limit, so stay below that.
     #[serde(default = "default_mouse_rate_hz")]
     mouse_rate_hz: u32,
     /// Slot lighting through a local OpenRGB server. Absent means off.
@@ -41,7 +43,7 @@ struct RawConfig {
 }
 
 fn default_mouse_rate_hz() -> u32 {
-    125
+    60
 }
 
 #[derive(Debug, Deserialize)]

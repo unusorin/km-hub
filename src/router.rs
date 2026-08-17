@@ -203,7 +203,9 @@ impl Router {
         match event.destructure() {
             EventSummary::Key(_, key, value) => match self.fsm.on_key(key, value) {
                 Verdict::Swallow => {}
-                Verdict::SwitchTo { slot, fire_hooks } => self.switch_to(slot, fire_hooks)?,
+                Verdict::SwitchTo { slot, fire_hooks, held_mods } => {
+                    self.switch_to(slot, fire_hooks, &held_mods)?
+                }
                 Verdict::RunMacro { index, held_mods } => self.run_macro(index, &held_mods)?,
                 Verdict::Pass => {
                     if self.slot == LOCAL_SLOT {
@@ -273,7 +275,31 @@ impl Router {
     /// silent: moving the keyboard to a machine and triggering the side effect
     /// that belongs to it are separate wishes, and only the second one is worth
     /// asking for explicitly.
-    fn switch_to(&mut self, slot: u8, fire_hooks: bool) -> Result<()> {
+    /// Release the modifier keys of a swallowed combo on the *current* target.
+    /// Their presses were forwarded before the combo completed and the FSM
+    /// swallows their releases, so without this the host is left holding
+    /// Ctrl+Alt: every later keystroke arrives as Ctrl+Alt+<key> — "the
+    /// keyboard stopped working" — until the user taps them again.
+    fn release_combo_mods(&mut self, held_mods: &[KeyCode]) -> Result<()> {
+        if self.slot == LOCAL_SLOT {
+            let held: Vec<KeyCode> = held_mods
+                .iter()
+                .copied()
+                .filter(|k| self.local_held.remove(k))
+                .collect();
+            if !held.is_empty() {
+                self.sink.release_keys(&held)?;
+            }
+        } else {
+            for key in held_mods {
+                self.translator.handle_key(*key, 0);
+            }
+            self.flush_remote();
+        }
+        Ok(())
+    }
+
+    fn switch_to(&mut self, slot: u8, fire_hooks: bool, held_mods: &[KeyCode]) -> Result<()> {
         // A combo pressed for the slot you are already on is a re-assert, not a
         // switch: nothing about the routing changes, but everything that hangs
         // off the slot is asserted again. That is the retry for a side effect
@@ -282,6 +308,9 @@ impl Router {
         // keyboard two-tone.
         if slot == self.slot {
             debug!(slot, hooks = fire_hooks, "already on this slot — re-asserting");
+            // No switch, so no release_all on the way out: let go of the
+            // combo modifiers here or they stay held on this very host.
+            self.release_combo_mods(held_mods)?;
             // Lighting always: it is the half of the re-assert with no side
             // effects, so it needs no opt-in. Hooks only with Shift, as ever.
             self.repaint_lighting();
@@ -290,22 +319,22 @@ impl Router {
             }
             return Ok(());
         }
-        let name = if slot == LOCAL_SLOT {
-            "local".to_string()
+        let bound = if slot == LOCAL_SLOT {
+            Some("local".to_string())
         } else {
-            match self.bindings_rx.borrow().get(&slot) {
-                Some(binding) => binding.name.clone(),
-                None => {
-                    // Unbound slot: open a pairing window instead of switching.
-                    // The combo was already swallowed by the FSM either way.
-                    // No hooks even with Shift — the slot never became active.
-                    info!(slot, "slot unbound — requesting pairing window");
-                    if self.bt_cmd_tx.try_send(BtCmd::OpenPairingWindow { slot }).is_err() {
-                        warn!(slot, "bluetooth task not accepting commands");
-                    }
-                    return Ok(());
-                }
+            self.bindings_rx.borrow().get(&slot).map(|b| b.name.clone())
+        };
+        let Some(name) = bound else {
+            // Unbound slot: open a pairing window instead of switching.
+            // The combo was already swallowed by the FSM either way.
+            // No hooks even with Shift — the slot never became active.
+            info!(slot, "slot unbound — requesting pairing window");
+            if self.bt_cmd_tx.try_send(BtCmd::OpenPairingWindow { slot }).is_err() {
+                warn!(slot, "bluetooth task not accepting commands");
             }
+            // Same as the re-assert: we stay put, so release here.
+            self.release_combo_mods(held_mods)?;
+            return Ok(());
         };
 
         // Release everything on the target we are leaving.
@@ -361,21 +390,7 @@ impl Router {
     /// those modifiers here or the target keeps a phantom Ctrl held down.
     fn run_macro(&mut self, index: usize, held_mods: &[KeyCode]) -> Result<()> {
         debug!(index, slot = self.slot, ?held_mods, "macro combo pressed");
-        if self.slot == LOCAL_SLOT {
-            let held: Vec<KeyCode> = held_mods
-                .iter()
-                .copied()
-                .filter(|k| self.local_held.remove(k))
-                .collect();
-            if !held.is_empty() {
-                self.sink.release_keys(&held)?;
-            }
-        } else {
-            for key in held_mods {
-                self.translator.handle_key(*key, 0);
-            }
-            self.flush_remote();
-        }
+        self.release_combo_mods(held_mods)?;
         if let Some(tx) = &self.hook_tx
             && tx.try_send(HookEvent::Macro(index)).is_err()
         {

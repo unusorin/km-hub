@@ -102,7 +102,7 @@ Copy `config.example.toml` to `config.toml` (next to the binary's working direct
 
 ```toml
 adapter_alias = "KMHub"                   # name shown to clients
-# mouse_rate_hz = 125                     # cap for mouse *motion* reports over BT
+# mouse_rate_hz = 60                      # cap for mouse *motion* reports over BT
 # devices = ["/dev/input/by-id/..."]      # default: auto-detect keyboards/mice
 
 [[target]]
@@ -294,9 +294,24 @@ A systemd unit is provided (`km-hub.service`, `make install`) if you want it on 
 - *LE: the host paired the classic side* (shows a keyboard that never types) — the adapter is still
   dual-mode; run the `ControllerMode = le` step of `make setup`, forget the hub on the host, pair
   again.
-- *LE: pointer still coarse* — check the negotiated interval: `sudo btmon` shows
-  `LE Connection Update Complete` with the interval; it should be 11.25–15 ms. If it stays at the
-  host's default (30 ms+), check `systemctl status km-hub-linktune` and the debugfs values it sets.
+- *LE: pointer coarse, or lags by seconds and then catches up* — check the negotiated interval:
+  `sudo btmon` on the Pi shows it in `LE Connection Complete` / `LE Connection Update Complete`;
+  it should be 11.25–15 ms. At the Linux default (30 ms, two packets per event ≈ 66 reports/s) a
+  60 Hz mouse leaves no headroom, and one radio hiccup queues reports in bluetoothd that take
+  seconds to drain. The Pi asks for 9–12 (`km-hub-linktune`), but a *Linux client* may ignore that;
+  make the client create its connections at HID rate instead — in its `/etc/bluetooth/main.conf`:
+  ```ini
+  [LE]
+  MinConnectionInterval=9
+  MaxConnectionInterval=12
+  ConnectionLatency=0
+  ConnectionSupervisionTimeout=200
+  ```
+  then restart bluetoothd (or reboot) and reconnect. Both interval values matter — a 9–40 window
+  still comes up at 30 ms. Verify with `bluetoothctl disconnect <hub>` while `btmon` runs on the
+  Pi. macOS negotiates 11.25–15 ms on its own. `ConnectionSupervisionTimeout=200` (2 s) matters
+  too: at the kernel default of 420 ms a 0.4 s radio hole drops the link and costs a 1–2 s
+  reconnect, which is what a "lag after standby" episode often is.
 - *Colors don't change* — check the server is up (`systemctl status openrgb`, `ss -ltnp | grep
   6742`) and that km-hub logged `openrgb connected`. Run with `RUST_LOG=km_hub=debug` to see which
   devices and modes it picked up; a device whose modes take neither per-LED nor mode-specific
