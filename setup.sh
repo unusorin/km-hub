@@ -19,7 +19,7 @@ OPENRGB_RULES=/etc/udev/rules.d/60-openrgb.rules
 # a machine that ran setup.sh but is now a *client* of the hub — with '-P input'
 # bluetoothd cannot act as an HID host, so it will never accept our keyboard.
 if [[ "${1:-}" == "--undo" ]]; then
-    echo "== km-hub undo (bluetoothd drop-in + adapter class + LE-only mode + link tuning + OpenRGB service) =="
+    echo "== km-hub undo (bluetoothd drop-in/patch + adapter class + LE-only mode + link tuning + OpenRGB service) =="
     if [[ -f "$OPENRGB_UNIT" ]]; then
         sudo systemctl disable --now openrgb
         sudo rm -f "$OPENRGB_UNIT"
@@ -31,6 +31,11 @@ if [[ "${1:-}" == "--undo" ]]; then
         sudo systemctl disable --now km-hub-linktune
         sudo rm -f /etc/systemd/system/km-hub-linktune.service
         echo "   -> link tuning removed (adapters revert to their defaults on next boot)."
+    fi
+    if dpkg-divert --list /usr/libexec/bluetooth/bluetoothd | grep -q .; then
+        sudo rm -f /usr/libexec/bluetooth/bluetoothd
+        sudo dpkg-divert --remove --rename /usr/libexec/bluetooth/bluetoothd
+        echo "   -> stock bluetoothd restored."
     fi
     sudo rm -f /etc/systemd/system/bluetooth.service.d/km-hub.conf
     sudo rmdir /etc/systemd/system/bluetooth.service.d 2>/dev/null || true
@@ -218,6 +223,48 @@ if confirm "LE-only controller (ControllerMode = le in $MAINCONF) — required f
         sudo sed -i '0,/^\[General\]/s//[General]\nControllerMode = le/' "$MAINCONF"
         sudo systemctl restart bluetooth
         echo "   -> done (persistent). Hosts paired over classic HID must forget the hub and pair again over LE."
+    fi
+fi
+
+# 3d. Patched bluetoothd, for --transport le. Stock bluetoothd remembers a
+#     bonded host's "notifications on" (CCC) across disconnects and treats the
+#     host's re-enable on reconnect as a no-op, so it never hands km-hub a new
+#     notify session: the host (rebooted PC, Mac after sleep, phone back in
+#     range) shows connected but hears nothing. Working around it from the
+#     application (re-registering the GATT services) trades that for another
+#     BlueZ bug on Linux hosts (the on-disk record loses HID and auto-connect
+#     dies). patches/ makes bluetoothd forget those values when the link goes
+#     down; the reconnecting host re-enables them and everything follows.
+#     Built from the upstream tarball matching the installed version, only the
+#     daemon binary is replaced, via dpkg-divert so package upgrades keep the
+#     diversion (an upgrade to a new version does need this step again).
+BLUEZ_VER=$(/usr/libexec/bluetooth/bluetoothd -v 2>/dev/null || true)
+BLUEZ_PATCH="$(realpath "$(dirname "$0")")/patches/bluez-${BLUEZ_VER}-forget-ccc-on-disconnect.patch"
+BLUEZ_BIN=/usr/libexec/bluetooth/bluetoothd
+if [[ -f "$BLUEZ_PATCH" ]] &&
+    confirm "Build and install bluetoothd $BLUEZ_VER with the km-hub CCC patch (dpkg-divert, restarts bluetooth)?"; then
+    if grep -q "km-hub CCC patch" "$BLUEZ_BIN" 2>/dev/null; then
+        echo "   -> already installed."
+    else
+        sudo apt-get install -y -q build-essential pkg-config libglib2.0-dev libdbus-1-dev libudev-dev
+        BUILD=$HOME/bluez-build
+        mkdir -p "$BUILD" && cd "$BUILD"
+        [[ -f "bluez-${BLUEZ_VER}.tar.xz" ]] || curl -sSLO "https://www.kernel.org/pub/linux/bluetooth/bluez-${BLUEZ_VER}.tar.xz"
+        rm -rf "bluez-${BLUEZ_VER}"
+        tar xf "bluez-${BLUEZ_VER}.tar.xz"
+        cd "bluez-${BLUEZ_VER}"
+        patch -p1 < "$BLUEZ_PATCH"
+        # Marker so a rerun (and a human) can tell the binary apart.
+        echo 'const char km_hub_marker[] = "km-hub CCC patch";' >> src/main.c
+        ./configure --prefix=/usr --libexecdir=/usr/libexec --sysconfdir=/etc --localstatedir=/var \
+            --disable-client --disable-obex --disable-cups --disable-tools --disable-monitor \
+            --disable-hid2hci --disable-udev --disable-systemd --disable-manpages --disable-datafiles >/dev/null
+        make -j"$(nproc)" >/dev/null
+        cd - >/dev/null
+        sudo dpkg-divert --add --rename --divert "${BLUEZ_BIN}.distrib" "$BLUEZ_BIN"
+        sudo install -m755 "$BUILD/bluez-${BLUEZ_VER}/src/bluetoothd" "$BLUEZ_BIN"
+        sudo systemctl restart bluetooth
+        echo "   -> done: $BLUEZ_BIN is the patched build (stock binary kept as ${BLUEZ_BIN}.distrib)."
     fi
 fi
 

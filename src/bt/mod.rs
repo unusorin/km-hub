@@ -117,6 +117,10 @@ struct Manager {
     /// Bound hosts seen connected without an input-report session, and since
     /// when (see `poll_stuck_hosts`).
     stuck: HashMap<Address, Instant>,
+    /// Stuck hosts we disconnected so they reconnect fresh, and when. A host
+    /// stuck again within `KICK_MEMORY` of its kick escalates to a GATT
+    /// re-registration; forgotten once the host subscribes.
+    kicked: HashMap<Address, Instant>,
     /// Hosts already served by a re-registration during their current
     /// connection; forgotten when they disconnect. Bounds the churn to one
     /// re-registration per host connection.
@@ -134,6 +138,11 @@ struct Manager {
 /// taken to be stuck behind bluetoothd's remembered CCC state. Reconnecting
 /// hosts subscribe well inside a second; a full rediscovery took ~1.5 s.
 const STUCK_HOST_GRACE: Duration = Duration::from_secs(3);
+/// How long a kicked host stays "already kicked": stuck again inside this
+/// window means the reconnect did not help and the CCC state must be cleared
+/// by re-registering. Hosts reconnect within a second or two; the slack is
+/// for phones that take their time.
+const KICK_MEMORY: Duration = Duration::from_secs(30);
 /// Minimum spacing between two GATT re-registrations.
 const REREGISTER_COOLDOWN: Duration = Duration::from_secs(10);
 
@@ -236,6 +245,7 @@ pub async fn run(deps: BtDeps) -> Result<()> {
         state_path,
         pairing: None,
         stuck: HashMap::new(),
+        kicked: HashMap::new(),
         helped: HashSet::new(),
         last_reregister: None,
         rgb_tx,
@@ -527,20 +537,30 @@ impl Manager {
         }
     }
 
-    /// Once per second while a window is open: bind the first newly paired
-    /// device, or time the window out.
     /// Once a second: a bound host that bluetoothd shows connected, yet has
-    /// had no input-report session for `STUCK_HOST_GRACE`, is a host whose
-    /// notification re-enable bluetoothd swallowed (its CCC state survived
-    /// the disconnect). Re-registering the GATT application is the only way
-    /// to shake that loose; it costs every connected host a Service Changed
-    /// round trip, so do it once per host connection and not back to back.
+    /// had no input-report session for `STUCK_HOST_GRACE`, is either a host
+    /// whose notification re-enable bluetoothd swallowed (its CCC state
+    /// survived the disconnect — stock bluetoothd; the patched one on the Pi
+    /// forgets it) or a phone that subscribes in its own time. Remedies,
+    /// cheapest first:
+    ///
+    /// 1. Disconnect just that host. It reconnects within a second and, in
+    ///    practice, gets a fresh AcquireNotify; nobody else notices.
+    /// 2. If it comes back stuck again within `KICK_MEMORY` and *no other
+    ///    host is subscribed*, re-register the GATT application — the only
+    ///    thing that clears stock bluetoothd's stored CCC state. It costs
+    ///    every connected host a Service Changed round trip, and macOS does
+    ///    not re-attach its HID driver afterwards (it re-subscribes and then
+    ///    ignores the reports until reconnected), so with other hosts live it
+    ///    is not worth it: the host is left alone for this connection.
     async fn poll_stuck_hosts(&mut self, transport: &mut Transport) {
         if self.kind != TransportKind::Le {
             return;
         }
         let now = Instant::now();
+        self.kicked.retain(|_, t| now.duration_since(*t) < KICK_MEMORY);
         let mut trigger = None;
+        let mut others_subscribed = false;
         for b in self.bindings.values() {
             let addr = b.addr;
             let connected = match self.adapter.device(addr) {
@@ -554,18 +574,40 @@ impl Manager {
             }
             if transport.is_peer_connected(addr) {
                 self.stuck.remove(&addr);
+                self.kicked.remove(&addr);
+                others_subscribed = true;
                 continue;
             }
             if self.helped.contains(&addr) {
                 continue;
             }
             let since = *self.stuck.entry(addr).or_insert(now);
-            if now.duration_since(since) >= STUCK_HOST_GRACE {
+            if now.duration_since(since) >= STUCK_HOST_GRACE && trigger.is_none() {
                 trigger = Some((addr, b.name.clone()));
-                break;
             }
         }
         let Some((addr, name)) = trigger else { return };
+        if !self.kicked.contains_key(&addr) {
+            warn!(
+                %addr, %name,
+                "host connected but not subscribed to input reports; disconnecting it so it \
+                 reconnects afresh"
+            );
+            transport.drop_peer(addr);
+            self.kicked.insert(addr, now);
+            self.stuck.remove(&addr);
+            return;
+        }
+        if others_subscribed {
+            warn!(
+                %addr, %name,
+                "host still not subscribed after a reconnect; leaving it alone rather than \
+                 re-registering the HID application under the other hosts"
+            );
+            self.helped.insert(addr);
+            self.stuck.remove(&addr);
+            return;
+        }
         if self
             .last_reregister
             .is_some_and(|t| now.duration_since(t) < REREGISTER_COOLDOWN)
@@ -574,13 +616,13 @@ impl Manager {
         }
         warn!(
             %addr, %name,
-            "host connected but not subscribed to input reports (bluetoothd kept its \
-             pre-disconnect CCC state); re-registering the HID application"
+            "host still not subscribed after a reconnect; re-registering the HID application"
         );
         match transport.reregister_le().await {
             Ok(()) => {
                 self.last_reregister = Some(now);
                 self.stuck.clear();
+                self.kicked.clear();
                 // Every host with a live link gets the same reset; count them
                 // all as served so a host that ignores Service Changed does
                 // not keep us re-registering.
@@ -592,6 +634,8 @@ impl Manager {
         }
     }
 
+    /// Once per second while a window is open: bind the first newly paired
+    /// device, or time the window out.
     async fn poll_window(&mut self) {
         let Some(window) = &self.pairing else { return };
         let (slot, deadline, bound) = (window.slot, window.deadline, window.bound);

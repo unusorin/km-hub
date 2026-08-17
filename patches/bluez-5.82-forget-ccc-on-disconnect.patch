@@ -1,0 +1,32 @@
+--- a/src/gatt-database.c
++++ b/src/gatt-database.c
+@@ -324,6 +324,16 @@
+ 		ccc_cb->callback(NULL, ccc_cb->user_data);
+ }
+ 
++/* km-hub: see the patch description */
++static void forget_ccc_value(void *data, void *user_data)
++{
++	struct ccc_state *ccc = data;
++	uint16_t keep = PTR_TO_UINT(user_data);
++
++	if (ccc->handle != keep)
++		ccc->value = 0;
++}
++
+ static void att_disconnected(int err, void *user_data)
+ {
+ 	struct device_state *state = user_data;
+@@ -350,6 +360,12 @@
+ 			device_store_svc_chng_ccc(device, state->bdaddr_type,
+ 								ccc->value);
+ 
++		/* km-hub: a reconnecting bonded client re-enables its CCCs;
++		 * with the old values still here that write is a no-op and an
++		 * AcquireNotify application never hears from the client again.
++		 */
++		queue_foreach(state->ccc_states, forget_ccc_value,
++							UINT_TO_PTR(handle));
+ 		return;
+ 	}
+ 

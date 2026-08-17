@@ -77,13 +77,22 @@ read by the systemd unit.
    timeout and advertising interval for `--transport le` — none of which BlueZ sets for us.
    Finally, optional and only for LE mode: `ControllerMode = le`, which turns off the classic side
    so a dual-mode host cannot pair the transport we don't serve (breaks `--transport l2cap`).
+   Also LE-only, and needed for hosts to survive a reboot/sleep: a patched `bluetoothd`
+   (`patches/`, built from the upstream tarball of the installed version and swapped in with
+   `dpkg-divert`). Stock bluetoothd remembers a bonded host's "notifications on" across a
+   disconnect and treats the host's re-enable on reconnect as a no-op, so km-hub never gets a new
+   notify session — the host shows connected but hears nothing. The patch forgets those values when
+   the link drops. Without it km-hub falls back to re-registering its GATT services when it sees a
+   host connected without a session (`WARN ... re-registering the HID application`), which works
+   but, through another BlueZ bug, leaves Linux hosts' stored record without HID so they stop
+   auto-connecting after their next reboot; macOS also needed a manual disconnect/reconnect.
 5. Grants `cap_net_bind_service` to the binary (redone by `make deploy`).
 6. Optional: installs OpenRGB (upstream `.deb` + udev rules) and an `openrgb.service` running its
    SDK server on `127.0.0.1:6742`, for the slot lighting below. The service runs as root because
    OpenRGB's udev rules grant device access via `uaccess`, which only covers a seat-local login
    session — a hub reached over ssh has none.
 
-`./setup.sh --undo` reverts steps 3–4 (plugins, class, link tuning, LE-only mode) — use it on a
+`./setup.sh --undo` reverts steps 3–4 (plugins, patched bluetoothd, class, link tuning, LE-only mode) — use it on a
 machine that ran the setup but should now be a *client* (with `-P input`, bluetoothd cannot act as
 an HID host), or to go back from LE-only to classic HID.
 
@@ -276,6 +285,12 @@ A systemd unit is provided (`km-hub.service`, `make install`) if you want it on 
 - *LE: paired but no input* — the host has not enabled notifications yet. After pairing (and on
   every reconnect) the log should show `input report subscribed` three times (report IDs 1, 2, 4);
   without them frames are dropped as "host has not enabled this report". Forget and re-pair.
+- *LE: worked, host rebooted/slept, now connected but no input* — stock bluetoothd swallowing the
+  host's notification re-enable (see setup step 4, the patched bluetoothd). Interim: restart km-hub.
+- *LE: a Linux host stopped auto-connecting after its reboot* — its BlueZ record lost the HID
+  service (`bluetoothctl info <hub>` on the host lists no `Human Interface Device`); happens when
+  the hub's GATT services vanish or get re-registered while it is connected. One
+  `bluetoothctl connect <hub>` on the host while km-hub runs restores it.
 - *LE: the host paired the classic side* (shows a keyboard that never types) — the adapter is still
   dual-mode; run the `ControllerMode = le` step of `make setup`, forget the hub on the host, pair
   again.

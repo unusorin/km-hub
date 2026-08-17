@@ -30,7 +30,7 @@ REMOTE_BIN = $(REMOTE_DIR)/km-hub
 SSH        = ssh -o BatchMode=yes $(PI)
 # Files the Pi needs besides the binary. state.toml is written by the daemon
 # on the Pi and never uploaded.
-SUPPORT    = setup.sh km-hub.service config.toml config.example.toml README.md
+SUPPORT    = setup.sh km-hub.service config.toml config.example.toml README.md patches
 
 .PHONY: check build sync deploy setup pull-config run install restart stop status logs ssh clean-remote pi-required
 
