@@ -84,6 +84,9 @@ pub struct RouterDeps {
     pub rgb_tx: Option<mpsc::Sender<RgbEvent>>,
     pub bindings_rx: watch::Receiver<Bindings>,
     pub mouse_rate_hz: u32,
+    /// Slot to start on: the one remembered in the state file, or the local
+    /// slot. Restoring fires no hooks — only a combo does that.
+    pub initial_slot: u8,
 }
 
 impl Router {
@@ -99,10 +102,11 @@ impl Router {
             rgb_tx,
             bindings_rx,
             mouse_rate_hz,
+            initial_slot,
         } = deps;
         let mouse_interval = Duration::from_micros(1_000_000 / u64::from(mouse_rate_hz.max(1)));
         Self {
-            slot: LOCAL_SLOT,
+            slot: initial_slot,
             fsm: HotkeyFsm::with_macros(macros),
             translator: Translator::new(),
             sink,
@@ -130,7 +134,7 @@ impl Router {
         info!(
             slot = self.slot,
             mouse_rate_hz = 1_000_000 / self.mouse_interval.as_micros().max(1),
-            "router started (local target active)"
+            "router started"
         );
         loop {
             let flush_at = self.mouse_flush_at.unwrap_or_else(Instant::now);

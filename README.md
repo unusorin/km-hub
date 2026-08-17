@@ -16,8 +16,11 @@ with `Ctrl+Alt+F<n>`. Nothing to install on the clients — pair once, then swit
   Plain switching is silent, so you can look at another machine without also throwing the monitor over.
 - Any other combo you configure (`Ctrl+Alt+KP1`, `Super+F13`, …) is a [macro](#macros-optional):
   it runs a command on the hub, on whichever slot is active, and never reaches the target.
-- All paired hosts stay connected; switching is instant. Keys held during a switch are released
-  on the host you leave.
+- Keys held during a switch are released on the host you leave. By default (`connections =
+  "single"`) only the active slot's host is connected — like a multi-host keyboard's channel switch,
+  the target reconnects in about a second and keys typed meanwhile are replayed; `connections =
+  "all"` keeps every paired host connected and switches instantly. The active slot is remembered
+  across restarts.
 
 ## Hardware
 
@@ -102,6 +105,7 @@ Copy `config.example.toml` to `config.toml` (next to the binary's working direct
 
 ```toml
 adapter_alias = "KMHub"                   # name shown to clients
+# connections = "single"                  # LE: one host at a time ("all": keep every host connected)
 # mouse_rate_hz = 60                      # cap for mouse *motion* reports over BT
 # devices = ["/dev/input/by-id/..."]      # default: auto-detect keyboards/mice
 
@@ -115,7 +119,7 @@ slot = 3
 # mac = "AA:BB:CC:DD:EE:FF"   # optional: pre-seed a slot with a known address
 ```
 
-Learned bindings are stored in `state.toml` next to `config.toml`.
+Learned bindings and the last active slot are stored in `state.toml` next to `config.toml`.
 
 ### Lighting (optional)
 
@@ -264,9 +268,12 @@ slot's hooks along with the switch.
 - `l2cap` — classic Bluetooth HID (the original transport). The hub is a *slave* the host polls;
   km-hub dials the active slot's host and answers HIDP control requests. Fine with BlueZ hosts.
 - `le` — HID over GATT: the hub is a Bluetooth LE peripheral with HID, Battery and Device
-  Information services and advertises permanently (visible to strangers only while a pairing window
-  is open). Hosts connect to *us* whenever they see the advertisement — there is no dialing — and
-  hold an 11.25–15 ms connection interval per link. This is what Apple's own keyboards and mice
+  Information services and advertises (visible to strangers only while a pairing window is open)
+  whenever a host is expected: with `connections = "single"` only while the active slot's host is
+  away, with `"all"` while any bound host is. Hosts connect to *us* when they see the advertisement
+  — there is no dialing — and hold an 11.25–15 ms connection interval per link; in single mode a
+  slot switch disconnects the current host and the target reconnects on its own (~1 s, macOS a
+  little more). This is what Apple's own keyboards and mice
   use, and what makes macOS/iOS pointers smooth; over classic HID those hosts poll an active-mode
   slave every 30–50 ms and the pointer lags. Switching transports means every host must **forget
   the hub and pair again**: the two bearers keep separate bonds. Run `make setup` first for the LE
@@ -287,6 +294,16 @@ A systemd unit is provided (`km-hub.service`, `make install`) if you want it on 
   without them frames are dropped as "host has not enabled this report". Forget and re-pair.
 - *LE: worked, host rebooted/slept, now connected but no input* — stock bluetoothd swallowing the
   host's notification re-enable (see setup step 4, the patched bluetoothd). Interim: restart km-hub.
+- *LE: a short pause after switching* — expected with `connections = "single"`: the previous host is
+  disconnected and the target reconnects (`input report subscribed` three times for it in the log,
+  then `host attached after the switch` at debug level with the gap and how many held keys were
+  replayed). About a second on Linux, a little more on macOS. Much longer, or `host did not come
+  back after the switch`: the target is asleep or out of range. `connections = "all"` switches
+  instantly at the cost of every host sharing the radio.
+- *LE: a host connects and is dropped right away* (`bound host connected while its slot is not
+  active — dropping`) — single mode serves only the active slot; press that host's `Ctrl+Alt+F<n>`.
+  A host bound during a pairing window is kept until the window closes, then dropped unless you
+  switched to it.
 - *LE: a Linux host stopped auto-connecting after its reboot* — its BlueZ record lost the HID
   service (`bluetoothctl info <hub>` on the host lists no `Human Interface Device`); happens when
   the hub's GATT services vanish or get re-registered while it is connected. One

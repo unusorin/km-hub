@@ -3,6 +3,7 @@
 //! connection management and report streaming.
 
 pub mod gatt;
+pub mod replay;
 pub mod sdp;
 pub mod transport;
 
@@ -22,12 +23,13 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::config::{LOCAL_SLOT, Settings};
+use crate::config::{Connections, LOCAL_SLOT, Settings};
 use crate::hid::HidFrame;
 use crate::rgb::RgbEvent;
 use crate::state::{self, Binding, Bindings};
 use gatt::LeTransport;
-use transport::{L2capTransport, LogTransport, Transport};
+use replay::{Push, ReplayBuffer};
+use transport::{Incoming, L2capTransport, LogTransport, Transport};
 
 /// `org.bluez.Device1.Bonded` — true only when a persistent link key exists.
 /// A host that merely *connects* to us pairs Just-Works with "no bonding"
@@ -106,6 +108,16 @@ struct PairingWindow {
     bound: bool,
 }
 
+/// The active slot's host between connections (single-connection mode):
+/// frames for it are held here until it subscribes to their report.
+struct Pending {
+    addr: Address,
+    buffer: ReplayBuffer,
+    since: Instant,
+    /// Frames replayed so far, for the summary once the host is attached.
+    replayed: u32,
+}
+
 struct Manager {
     adapter: Adapter,
     kind: TransportKind,
@@ -129,10 +141,21 @@ struct Manager {
     rgb_tx: Option<mpsc::Sender<RgbEvent>>,
     /// The LE advertisement (LE mode only): connectable so bonded hosts can
     /// reconnect, discoverable only while a pairing window is open, and
-    /// dropped while every bound host is connected (`poll_advertising`).
-    /// Re-registered to flip the discoverable flag, since BlueZ reads an
-    /// advertisement's properties once.
+    /// dropped while nobody is expected (`apply_advertising`). Re-registered
+    /// to flip the discoverable flag, since BlueZ reads an advertisement's
+    /// properties once; `adv_discoverable` remembers which flavour is up.
     adv: Option<AdvertisementHandle>,
+    adv_discoverable: bool,
+    /// Mirror of the router's slot watch; the manager needs it outside the
+    /// loop prelude (incoming hosts, advertising, eviction).
+    active_slot: u8,
+    /// See `Pending`. `None` when the active host is attached, the active
+    /// slot is local, or the mode keeps every host connected.
+    pending: Option<Pending>,
+    /// Bound hosts told to disconnect because their slot is not active, and
+    /// when — so a host that lingers through bluetoothd's disconnect timer
+    /// is not told again every tick.
+    evicted: HashMap<Address, Instant>,
 }
 
 /// A bound host connected this long without any input-report session is
@@ -150,6 +173,15 @@ const REREGISTER_COOLDOWN: Duration = Duration::from_secs(10);
 /// bluer unregisters a dropped advertisement from a spawned task; give it a
 /// moment before registering the replacement or the two overlap.
 const ADV_REREGISTER_DELAY: Duration = Duration::from_millis(250);
+
+/// How long frames are held for a host that has not come back after a slot
+/// switch. Reconnects take a second or two, a stuck reconnect one kick
+/// (`STUCK_HOST_GRACE`) more; after this the buffered input is stale and is
+/// dropped (with its counts logged).
+const REPLAY_WINDOW: Duration = Duration::from_secs(8);
+/// Minimum spacing between two "disconnect, your slot is not active" nudges
+/// to the same host; bluetoothd takes up to 2 s to actually drop the link.
+const EVICT_COOLDOWN: Duration = Duration::from_secs(5);
 
 pub async fn run(deps: BtDeps) -> Result<()> {
     let BtDeps {
@@ -251,15 +283,25 @@ pub async fn run(deps: BtDeps) -> Result<()> {
         last_reregister: None,
         rgb_tx,
         adv: None,
+        adv_discoverable: false,
+        active_slot: *slot_rx.borrow(),
+        pending: None,
+        evicted: HashMap::new(),
     };
     if let Some((slot, b)) = mgr.bindings.iter().next_back() {
         debug!(slots = mgr.bindings.len(), last_slot = slot, last = %b.name, "loaded slot bindings");
     }
     if kind == TransportKind::Le {
+        info!(connections = ?mgr.settings.connections, slot = mgr.active_slot, "LE hosts connect to us");
         // Hosts connect to us on LE: advertise from the start (connectable,
-        // not discoverable) so bonded ones can come back on their own; the
-        // poll turns it off once they all have (see `poll_advertising`).
-        mgr.set_advertising(false).await?;
+        // not discoverable) for whoever is expected — every bound host, or
+        // just the active slot's — so it comes back on its own; the poll
+        // turns it off once it has (see `apply_advertising`).
+        let connected = mgr.connected_hosts().await;
+        mgr.apply_advertising(&connected).await;
+        mgr.arm_pending(&transport);
+    } else if mgr.settings.connections == Connections::Single {
+        debug!("connections = \"single\" applies to the LE transport only");
     }
 
     let mut poll = tokio::time::interval(Duration::from_secs(1));
@@ -273,10 +315,11 @@ pub async fn run(deps: BtDeps) -> Result<()> {
     let mut dial_task: Option<(Address, JoinHandle<Result<DialOutcome>>)> = None;
 
     loop {
-        // Every bound host may stay connected; we only *dial* the active
-        // slot's host when it isn't (classic only — LE hosts dial us). Frames
-        // are routed by their own slot tag.
-        let active_slot = *slot_rx.borrow();
+        // Classic: every bound host may stay connected; we only *dial* the
+        // active slot's host when it isn't. LE hosts dial us (see
+        // `on_slot_change` for what a switch means there). Frames are routed
+        // by their own slot tag.
+        let active_slot = mgr.active_slot;
         let dial = if transport.can_dial() { mgr.dial_target(active_slot) } else { None };
         if let Some((addr, task)) = &dial_task
             && dial != Some(*addr)
@@ -331,14 +374,30 @@ pub async fn run(deps: BtDeps) -> Result<()> {
             }
             _ = tokio::time::sleep_until(backoff_until), if wait_backoff => redial_at = None,
             res = transport.accept_incoming(), if transport.has_listeners() => match res {
-                Ok(peer) => mgr.on_incoming_peer(&mut transport, peer).await,
+                Ok(Incoming::Connected(peer)) => mgr.on_incoming_peer(&mut transport, peer).await,
+                Ok(Incoming::Subscribed { peer, report_id, first }) => {
+                    if first {
+                        mgr.on_incoming_peer(&mut transport, peer).await;
+                    }
+                    mgr.on_subscribed(&mut transport, peer, report_id).await?;
+                }
                 Err(err) => warn!(%err, "incoming accept failed"),
             },
             msg = frame_rx.recv() => match msg {
-                Some((slot, frame)) => match mgr.bindings.get(&slot).map(|b| b.addr) {
-                    Some(peer) => transport.send_to(peer, &frame).await?,
-                    None => debug!(slot, "frame for unbound slot, dropping"),
-                },
+                Some((slot, frame)) => {
+                    // A frame for another slot can overtake the slot watch in
+                    // this select!: the router tags frames with the slot it
+                    // has already switched to. Take the switch first, so the
+                    // frame is held for the new host instead of being sent to
+                    // one that is not subscribed. (Frames for the slot being
+                    // left were queued before the watch changed and never
+                    // trip this.)
+                    if slot != mgr.active_slot && slot_rx.has_changed().unwrap_or(false) {
+                        let new = *slot_rx.borrow_and_update();
+                        mgr.on_slot_change(&mut transport, &mut frame_rx, new).await?;
+                    }
+                    mgr.route_frame(&mut transport, slot, frame).await?
+                }
                 None => break,
             },
             cmd = cmd_rx.recv() => match cmd {
@@ -348,10 +407,15 @@ pub async fn run(deps: BtDeps) -> Result<()> {
             _ = poll.tick() => {
                 mgr.poll_window().await;
                 let connected = mgr.connected_hosts().await;
-                mgr.poll_advertising(&connected).await;
+                mgr.poll_uninvited(&mut transport, &connected);
+                mgr.apply_advertising(&connected).await;
                 mgr.poll_stuck_hosts(&mut transport, &connected).await;
+                mgr.poll_pending();
             }
-            _ = slot_rx.changed() => {}
+            _ = slot_rx.changed() => {
+                let slot = *slot_rx.borrow_and_update();
+                mgr.on_slot_change(&mut transport, &mut frame_rx, slot).await?;
+            }
             req = profile_request => log_connect_request(req),
         }
     }
@@ -384,7 +448,14 @@ impl Manager {
     async fn set_visible(&mut self, on: bool) -> bluer::Result<()> {
         match self.kind {
             TransportKind::Log | TransportKind::L2cap => self.adapter.set_discoverable(on).await,
-            TransportKind::Le => self.set_advertising(on).await,
+            TransportKind::Le if on => self.set_advertising(true).await,
+            TransportKind::Le => {
+                // Back to whatever the mode wants: a connectable advertisement
+                // for the hosts still expected, or none at all.
+                let connected = self.connected_hosts().await;
+                self.apply_advertising(&connected).await;
+                Ok(())
+            }
         }
     }
 
@@ -395,6 +466,7 @@ impl Manager {
         }
         let adv = gatt::advertisement(&self.settings.adapter_alias, discoverable);
         self.adv = Some(self.adapter.advertise(adv).await?);
+        self.adv_discoverable = discoverable;
         info!(discoverable, "LE advertising (connectable HID peripheral)");
         Ok(())
     }
@@ -444,7 +516,7 @@ impl Manager {
                     "now forget this hub on the client too, then pair again while the window is open"
                 );
                 let _ = self.bindings_tx.send(self.bindings.clone());
-                state::save(&self.state_path, &self.bindings);
+                state::save(&self.state_path, &self.bindings, self.active_slot);
             }
             None => {
                 // The plain press already opened a window for this slot; the
@@ -475,7 +547,7 @@ impl Manager {
         }
         self.bindings.remove(&slot);
         let _ = self.bindings_tx.send(self.bindings.clone());
-        state::save(&self.state_path, &self.bindings);
+        state::save(&self.state_path, &self.bindings, self.active_slot);
         self.open_window(slot).await;
     }
 
@@ -554,27 +626,232 @@ impl Manager {
         out
     }
 
-    /// Once a second, outside a pairing window (which owns the advertisement
-    /// while open): advertise only while some bound host is away. Bonded
-    /// hosts reconnect on their own the moment we advertise, so nothing is
-    /// lost, and while everyone is here the radio is not spending 100–150 ms
-    /// slots on advertising events between three connections' anchor points.
-    async fn poll_advertising(&mut self, connected: &HashSet<Address>) {
-        if self.kind != TransportKind::Le || self.pairing.is_some() {
+    /// LE with `connections = "single"`: one host at a time.
+    fn single(&self) -> bool {
+        self.kind == TransportKind::Le && self.settings.connections == Connections::Single
+    }
+
+    /// The host frames go to right now; none while the local slot is active
+    /// or the active slot is unbound.
+    fn active_host(&self) -> Option<Address> {
+        (self.active_slot != LOCAL_SLOT)
+            .then(|| self.bindings.get(&self.active_slot).map(|b| b.addr))
+            .flatten()
+    }
+
+    fn slot_of(&self, addr: Address) -> Option<u8> {
+        self.bindings.iter().find(|(_, b)| b.addr == addr).map(|(&slot, _)| slot)
+    }
+
+    /// Whether this slot's host is one we keep connected: every bound host,
+    /// or in single mode only the active one.
+    fn serves(&self, slot: u8) -> bool {
+        !self.single() || slot == self.active_slot
+    }
+
+    /// Bring the advertisement in line with who is expected to connect (see
+    /// `wants_advertising`), unless an unsettled pairing window owns it: that
+    /// one is discoverable, and `open_window`/`close_window` handle it.
+    /// Called from the 1 s tick, on a slot switch (so the target's reconnect
+    /// starts at once) and when a window settles or closes.
+    async fn apply_advertising(&mut self, connected: &HashSet<Address>) {
+        if self.kind != TransportKind::Le || self.pairing.as_ref().is_some_and(|w| !w.bound) {
             return;
         }
-        let all_here = self.bindings.values().all(|b| connected.contains(&b.addr));
-        match (all_here, self.adv.is_some()) {
-            (true, true) => {
-                self.adv.take();
-                info!("every bound host is connected; advertising off");
-            }
-            (false, false) => {
+        let bound: Vec<Address> = self.bindings.values().map(|b| b.addr).collect();
+        let want = wants_advertising(self.settings.connections, self.active_host(), &bound, connected);
+        match (want, self.adv.is_some()) {
+            (true, false) => {
                 if let Err(err) = self.set_advertising(false).await {
-                    warn!(%err, "cannot resume advertising");
+                    warn!(%err, "cannot start advertising");
                 }
             }
+            (true, true) if self.adv_discoverable => {
+                // A settled pairing window: stay connectable, stop being seen.
+                if let Err(err) = self.set_advertising(false).await {
+                    warn!(%err, "cannot leave discoverable mode");
+                }
+            }
+            (false, true) => {
+                self.adv.take();
+                info!("expected hosts connected; advertising off");
+            }
             _ => {}
+        }
+    }
+
+    /// Hold frames for the active host until it subscribes (single mode
+    /// only, and only if it is not attached already). Called after a slot
+    /// switch and at startup.
+    fn arm_pending(&mut self, transport: &Transport) {
+        self.pending = None;
+        if !self.single() {
+            return;
+        }
+        let Some(addr) = self.active_host() else { return };
+        if gatt::INPUT_REPORT_IDS.iter().all(|&id| transport.is_subscribed(addr, id)) {
+            return;
+        }
+        self.pending = Some(Pending {
+            addr,
+            buffer: ReplayBuffer::new(),
+            since: Instant::now(),
+            replayed: 0,
+        });
+    }
+
+    /// The router moved to another slot. Classic and "all" mode: remember
+    /// it (the classic loop dials from it). Single mode, the channel switch:
+    ///
+    /// 1. flush what the router already queued — its `release_all` frames for
+    ///    the host we are leaving went into `frame_rx` *before* the slot
+    ///    watch changed, and mpsc keeps that order, so they still find the
+    ///    old host subscribed;
+    /// 2. hold frames for the new host until it subscribes;
+    /// 3. advertise now rather than at the next tick, so the new host's
+    ///    reconnect starts immediately;
+    /// 4. disconnect the old host. bluetoothd defers the actual link drop by
+    ///    up to 2 s (bluetoothd's DISCONNECT_TIMER, see `LeTransport::
+    ///    shutdown`), so the release notifications queued in (1) go out first.
+    async fn on_slot_change(
+        &mut self,
+        transport: &mut Transport,
+        frame_rx: &mut mpsc::Receiver<(u8, HidFrame)>,
+        slot: u8,
+    ) -> Result<()> {
+        let old_host = self.active_host();
+        self.active_slot = slot;
+        state::save(&self.state_path, &self.bindings, self.active_slot);
+        if !self.single() {
+            return Ok(());
+        }
+        while let Ok((slot, frame)) = frame_rx.try_recv() {
+            self.route_frame(transport, slot, frame).await?;
+        }
+        if let Some(p) = self.pending.take()
+            && !p.buffer.is_empty()
+        {
+            let (dropped_motion, evicted) = p.buffer.stats();
+            debug!(peer = %p.addr, held = p.buffer.len(), dropped_motion, evicted, "switched away before the host came back; held frames dropped");
+        }
+        self.arm_pending(transport);
+        let new_host = self.active_host();
+        let connected = self.connected_hosts().await;
+        self.apply_advertising(&connected).await;
+        if let Some(old) = old_host
+            && Some(old) != new_host
+        {
+            info!(peer = %old, slot = self.slot_of(old), "slot switch — disconnecting the previous host");
+            transport.drop_peer(old);
+            self.forget_host(old);
+            // bluetoothd shows it connected for up to 2 s more; the eviction
+            // sweep need not tell it again.
+            self.evicted.insert(old, Instant::now());
+        }
+        Ok(())
+    }
+
+    /// Drop every per-connection note about a host we just disconnected.
+    fn forget_host(&mut self, addr: Address) {
+        self.stuck.remove(&addr);
+        self.kicked.remove(&addr);
+        self.helped.remove(&addr);
+        self.evicted.remove(&addr);
+    }
+
+    /// Send a frame to its slot's host, or hold it if that host is the one
+    /// we are waiting for and has not enabled this report yet.
+    async fn route_frame(&mut self, transport: &mut Transport, slot: u8, frame: HidFrame) -> Result<()> {
+        let Some(peer) = self.bindings.get(&slot).map(|b| b.addr) else {
+            debug!(slot, "frame for unbound slot, dropping");
+            return Ok(());
+        };
+        if let Some(p) = &mut self.pending
+            && p.addr == peer
+            && !transport.is_subscribed(peer, frame.report_id())
+        {
+            match p.buffer.push(frame) {
+                Push::Queued => {}
+                Push::DroppedMotion => {}
+                Push::Evicted => debug!(%peer, "replay buffer full — oldest held frame dropped"),
+            }
+            return Ok(());
+        }
+        transport.send_to(peer, &frame).await
+    }
+
+    /// A host enabled one of its input reports: if it is the one we are
+    /// holding frames for, replay that report's frames now, and once all
+    /// three reports are enabled, stop holding.
+    async fn on_subscribed(&mut self, transport: &mut Transport, peer: Address, report_id: u8) -> Result<()> {
+        let Some(p) = &mut self.pending else { return Ok(()) };
+        // `on_incoming_peer` may just have dropped an uninvited host.
+        if p.addr != peer || !transport.is_subscribed(peer, report_id) {
+            return Ok(());
+        }
+        let frames = p.buffer.take(report_id);
+        if !frames.is_empty() {
+            debug!(%peer, report_id, replayed = frames.len(), "replaying frames held during the reconnect");
+        }
+        p.replayed += frames.len() as u32;
+        for frame in &frames {
+            transport.send_to(peer, frame).await?;
+        }
+        if gatt::INPUT_REPORT_IDS.iter().all(|&id| transport.is_subscribed(peer, id)) {
+            let p = self.pending.take().expect("checked above");
+            let (dropped_motion, evicted) = p.buffer.stats();
+            debug!(
+                %peer,
+                gap_ms = p.since.elapsed().as_millis(),
+                replayed = p.replayed,
+                dropped_motion,
+                evicted,
+                "host attached after the switch"
+            );
+        }
+        Ok(())
+    }
+
+    /// Single mode, once a second: a bound host whose slot is not active but
+    /// which is connected anyway (it woke up and saw our advertisement, or is
+    /// left over from before a restart) is told to go — unless a pairing
+    /// window is open, which is how a host just bound to another slot looks.
+    /// Both notions of connected are checked because bluetoothd's
+    /// `Connected` has been seen lagging behind a fast reconnect.
+    fn poll_uninvited(&mut self, transport: &mut Transport, connected: &HashSet<Address>) {
+        if !self.single() || self.pairing.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        self.evicted.retain(|_, t| now.duration_since(*t) < EVICT_COOLDOWN);
+        let uninvited: Vec<(u8, Address)> = self
+            .bindings
+            .iter()
+            .filter(|(slot, b)| {
+                **slot != self.active_slot
+                    && (connected.contains(&b.addr) || transport.is_peer_connected(b.addr))
+                    && !self.evicted.contains_key(&b.addr)
+            })
+            .map(|(&slot, b)| (slot, b.addr))
+            .collect();
+        for (slot, addr) in uninvited {
+            info!(peer = %addr, slot, active = self.active_slot, "bound host connected while its slot is not active — dropping");
+            transport.drop_peer(addr);
+            self.evicted.insert(addr, now);
+        }
+    }
+
+    /// Give up on held frames once the reconnect has clearly not happened
+    /// (the host is off, or out of range). Loud only if there was input.
+    fn poll_pending(&mut self) {
+        if self.pending.as_ref().is_some_and(|p| p.since.elapsed() >= REPLAY_WINDOW) {
+            let p = self.pending.take().expect("checked above");
+            let (dropped_motion, evicted) = p.buffer.stats();
+            if p.buffer.is_empty() {
+                debug!(peer = %p.addr, "host has not come back yet; no longer holding frames for it");
+            } else {
+                warn!(peer = %p.addr, held = p.buffer.len(), dropped_motion, evicted, "host did not come back after the switch; held frames dropped");
+            }
         }
     }
 
@@ -602,8 +879,13 @@ impl Manager {
         self.kicked.retain(|_, t| now.duration_since(*t) < KICK_MEMORY);
         let mut trigger = None;
         let mut others_subscribed = false;
-        for b in self.bindings.values() {
+        for (&slot, b) in &self.bindings {
             let addr = b.addr;
+            // Single mode: a host we are disconnecting or evicting is not
+            // stuck, it is leaving.
+            if !self.serves(slot) {
+                continue;
+            }
             if !connected.contains(&addr) {
                 self.stuck.remove(&addr);
                 self.helped.remove(&addr);
@@ -718,7 +1000,17 @@ impl Manager {
     /// key) would reject our HID traffic, so drop it and ask for a real Pair.
     /// Unknown hosts outside a window are dropped.
     async fn on_incoming_peer(&mut self, transport: &mut Transport, peer: Address) {
-        if self.bindings.values().any(|b| b.addr == peer) {
+        if let Some(slot) = self.slot_of(peer) {
+            // A bound host. Single mode serves only the active slot's; one
+            // that shows up anyway (it woke and saw us advertising for
+            // another host) is sent away — except during a pairing window,
+            // when it is most likely the host that was just bound to another
+            // slot and is still finishing its bond.
+            if !self.serves(slot) && self.pairing.is_none() {
+                info!(%peer, slot, active = self.active_slot, "bound host connected while its slot is not active — dropping");
+                transport.drop_peer(peer);
+                self.evicted.insert(peer, Instant::now());
+            }
             return;
         }
         let Some(window) = &self.pairing else {
@@ -779,7 +1071,7 @@ impl Manager {
             },
         );
         let _ = self.bindings_tx.send(self.bindings.clone());
-        state::save(&self.state_path, &self.bindings);
+        state::save(&self.state_path, &self.bindings, self.active_slot);
         self.notify_rgb(RgbEvent::Bound);
     }
 }
@@ -792,6 +1084,20 @@ enum DialOutcome {
 }
 
 /// One device-initiated connection attempt to the active slot's host.
+/// Whether to run the connectable advertisement: it is what lets a bonded
+/// host reconnect, and it costs radio time while it runs. With every host
+/// kept connected, advertise while any bound one is away; with one host at a
+/// time, only while the active slot's host is away (never for the local slot
+/// or an unbound one — nobody is expected). `connected` is bluetoothd's view
+/// (`Device1.Connected`): the link is what matters here, the input-report
+/// subscription that follows is the stuck-host logic's business.
+fn wants_advertising(mode: Connections, active_host: Option<Address>, bound: &[Address], connected: &HashSet<Address>) -> bool {
+    match mode {
+        Connections::All => bound.iter().any(|a| !connected.contains(a)),
+        Connections::Single => active_host.is_some_and(|a| !connected.contains(&a)),
+    }
+}
+
 async fn dial_active(addr: Address, adapter: &Adapter) -> Result<DialOutcome> {
     // A device whose pairing was removed will never accept our HID
     // connection; surface it so the binding can be healed.
@@ -870,5 +1176,44 @@ fn make_agent() -> Agent {
             .boxed()
         })),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(last: u8) -> Address {
+        Address::new([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, last])
+    }
+
+    #[test]
+    fn all_mode_advertises_while_any_bound_host_is_away() {
+        let bound = [addr(1), addr(2)];
+        let here: HashSet<Address> = [addr(1)].into_iter().collect();
+        assert!(wants_advertising(Connections::All, Some(addr(1)), &bound, &here));
+        let both: HashSet<Address> = bound.iter().copied().collect();
+        assert!(!wants_advertising(Connections::All, Some(addr(1)), &bound, &both));
+        // Bound hosts away, local slot active: still advertise — they may come back.
+        assert!(wants_advertising(Connections::All, None, &bound, &here));
+    }
+
+    #[test]
+    fn single_mode_advertises_only_for_the_active_host() {
+        let bound = [addr(1), addr(2)];
+        let none = HashSet::new();
+        assert!(wants_advertising(Connections::Single, Some(addr(2)), &bound, &none));
+        let two: HashSet<Address> = [addr(2)].into_iter().collect();
+        assert!(!wants_advertising(Connections::Single, Some(addr(2)), &bound, &two));
+        // The other host being away is not our concern.
+        let one: HashSet<Address> = [addr(1)].into_iter().collect();
+        assert!(wants_advertising(Connections::Single, Some(addr(2)), &bound, &one));
+    }
+
+    #[test]
+    fn single_mode_never_advertises_for_the_local_or_an_unbound_slot() {
+        let bound = [addr(1), addr(2)];
+        let none = HashSet::new();
+        assert!(!wants_advertising(Connections::Single, None, &bound, &none));
     }
 }

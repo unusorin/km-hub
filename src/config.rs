@@ -15,11 +15,28 @@ pub const LOCAL_SLOT: u8 = 1;
 /// Highest hotkey slot (Ctrl+Alt+F12).
 pub const MAX_SLOT: u8 = 12;
 
+/// How many LE hosts the hub keeps connected at once (`connections =` in the
+/// config; the classic transport ignores it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Connections {
+    /// One link at a time — the active slot's host, like a multi-host
+    /// keyboard's channel switch: switching disconnects the current host and
+    /// advertises until the target reconnects (~1 s). One central at a time
+    /// keeps the Pi's radio from starving under two hosts' anchor points.
+    Single,
+    /// Every bound host stays connected; switching is instant.
+    All,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     #[serde(default = "default_alias")]
     adapter_alias: String,
+    /// See [`Connections`].
+    #[serde(default = "default_connections")]
+    connections: Connections,
     /// Explicit input device paths; `None` means auto-detect.
     devices: Option<Vec<PathBuf>>,
     /// Max mouse *motion* report rate over Bluetooth (Hz). Buttons and keys
@@ -44,6 +61,10 @@ struct RawConfig {
 
 fn default_mouse_rate_hz() -> u32 {
     60
+}
+
+fn default_connections() -> Connections {
+    Connections::Single
 }
 
 #[derive(Debug, Deserialize)]
@@ -321,6 +342,8 @@ impl RgbSettings {
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub adapter_alias: String,
+    /// See [`Connections`].
+    pub connections: Connections,
     pub devices: Option<Vec<PathBuf>>,
     /// See `RawConfig::mouse_rate_hz`.
     pub mouse_rate_hz: u32,
@@ -438,6 +461,7 @@ impl Settings {
 
         Ok(Self {
             adapter_alias: raw.adapter_alias,
+            connections: raw.connections,
             mouse_rate_hz: raw.mouse_rate_hz.clamp(20, 1000),
             devices: raw.devices,
             rgb,
@@ -607,6 +631,26 @@ mod tests {
         assert!(settings.rgb.enabled);
         assert_eq!(settings.rgb.brightness, 60);
         assert_eq!(settings.rgb.slot_color(2), rgb("#ff0000"));
+        assert_eq!(settings.connections, Connections::Single);
+    }
+
+    #[test]
+    fn connections_defaults_to_single() {
+        let settings = Settings::parse("").unwrap();
+        assert_eq!(settings.connections, Connections::Single);
+    }
+
+    #[test]
+    fn connections_accepts_all() {
+        let settings = Settings::parse(r#"connections = "all""#).unwrap();
+        assert_eq!(settings.connections, Connections::All);
+    }
+
+    #[test]
+    fn an_unknown_connections_value_is_rejected() {
+        let err = Settings::parse(r#"connections = "some""#).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("single") && msg.contains("all"), "{msg}");
     }
 
     #[test]

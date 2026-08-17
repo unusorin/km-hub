@@ -61,6 +61,18 @@ pub enum Transport {
     Le(LeTransport),
 }
 
+/// What `accept_incoming` woke up for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Incoming {
+    /// Classic: a host's control and interrupt channels are both up.
+    Connected(Address),
+    /// LE: `peer` enabled notifications on input report `report_id`. `first`
+    /// marks the peer's first subscription of this connection — the moment it
+    /// counts as attached; the following ones (a host enables the reports one
+    /// by one, ~30 ms apart) matter to whoever is holding frames for it.
+    Subscribed { peer: Address, report_id: u8, first: bool },
+}
+
 impl Transport {
     /// Send a frame to `peer` (no-op with a debug log if it is not connected).
     pub async fn send_to(&mut self, peer: Address, frame: &HidFrame) -> Result<()> {
@@ -76,6 +88,17 @@ impl Transport {
             Transport::Log(_) => true,
             Transport::L2cap(t) => t.conns.contains_key(&peer),
             Transport::Le(t) => t.is_peer_connected(peer),
+        }
+    }
+
+    /// Whether a frame with this report id would reach `peer` right now. On
+    /// LE that is per report (the host enables each one separately); the
+    /// other variants have one channel for everything.
+    pub fn is_subscribed(&self, peer: Address, report_id: u8) -> bool {
+        match self {
+            Transport::Log(_) => true,
+            Transport::L2cap(t) => t.conns.contains_key(&peer),
+            Transport::Le(t) => t.is_subscribed(peer, report_id),
         }
     }
 
@@ -130,14 +153,14 @@ impl Transport {
         }
     }
 
-    /// Wait for an incoming HID connection (control then interrupt) and
-    /// return the peer's address. Cancel-safe: an accepted control channel is
-    /// parked until its interrupt channel arrives on a later call.
-    /// Only meaningful for the L2CAP variant; guarded by `has_listeners()`.
-    pub async fn accept_incoming(&mut self) -> Result<Address> {
+    /// Wait for a host to attach: on classic an incoming HID connection
+    /// (control then interrupt), on LE an input-report subscription. Cancel-
+    /// safe: an accepted control channel is parked until its interrupt channel
+    /// arrives on a later call. Guarded by `has_listeners()`.
+    pub async fn accept_incoming(&mut self) -> Result<Incoming> {
         match self {
             Transport::Log(_) => futures::future::pending().await,
-            Transport::L2cap(t) => t.accept_incoming().await,
+            Transport::L2cap(t) => t.accept_incoming().await.map(Incoming::Connected),
             Transport::Le(t) => t.accept_incoming().await,
         }
     }

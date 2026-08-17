@@ -4,6 +4,18 @@
 # while a pairing window is open (see below), not permanently.
 adapter_alias = "KMHub"
 
+# How many hosts stay connected over LE (the classic transport ignores this).
+#   "single" (default) — one at a time, the active slot's, like a multi-host
+#             keyboard's channel switch: switching disconnects the current host
+#             and advertises until the target reconnects (~1 s on Linux, ~1.3 s
+#             on macOS, which re-reads the GATT database first). Keys typed in
+#             that gap are held and replayed; pointer motion is not. Other bound
+#             hosts that connect meanwhile are dropped. Keeps one central at a
+#             time on the Pi's radio, which two hosts' anchor points can starve.
+#             The active slot is remembered across restarts.
+#   "all"    — every bound host stays connected; switching is instant.
+# connections = "single"
+
 # Max mouse *motion* report rate over Bluetooth, in Hz (default 60). Gaming
 # mice poll at 500-1000 Hz; forwarding every packet floods the BT link and
 # shows up as cursor lag. Buttons and keys are never delayed by this.

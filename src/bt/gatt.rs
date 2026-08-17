@@ -33,6 +33,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use super::transport::Incoming;
 use crate::hid::{BATTERY_LEVEL, BATTERY_REPORT_ID, HidFrame, REPORT_DESCRIPTOR};
 
 // Assigned numbers (Bluetooth SIG).
@@ -64,6 +65,9 @@ pub const REPORT_ID_MOUSE: u8 = 2;
 pub const REPORT_ID_CONSUMER: u8 = 4;
 /// Input report IDs and their zero-state payload lengths (ID byte excluded).
 const INPUT_REPORTS: [(u8, usize); 3] = [(REPORT_ID_KEYBOARD, 8), (REPORT_ID_MOUSE, 4), (REPORT_ID_CONSUMER, 2)];
+/// The input report IDs a host enables one by one; all three subscribed
+/// means it is fully attached.
+pub const INPUT_REPORT_IDS: [u8; 3] = [REPORT_ID_KEYBOARD, REPORT_ID_MOUSE, REPORT_ID_CONSUMER];
 
 /// PnP ID: vendor ID source USB, VID Linux Foundation, product 1, version 1.0.
 /// HOGP requires a PnP ID; not Apple's VID.
@@ -452,18 +456,22 @@ impl LeTransport {
         self.peers.get(&peer).is_some_and(|p| !p.subs.is_empty())
     }
 
-    /// Wait until a host we have not seen before subscribes to an input
-    /// report, and return its address. Later subscriptions from known hosts
-    /// and closed sessions are absorbed here as bookkeeping. Cancel-safe: the
-    /// state changes synchronously after each await returns.
-    pub async fn accept_incoming(&mut self) -> Result<Address> {
+    /// Whether `peer` has notifications enabled on this input report.
+    pub fn is_subscribed(&self, peer: Address, report_id: u8) -> bool {
+        self.peers.get(&peer).is_some_and(|p| p.subs.contains_key(&report_id))
+    }
+
+    /// Wait until a host subscribes to an input report and say which; the
+    /// peer's first subscription is flagged so the caller can treat it as
+    /// the host attaching. Closed sessions are absorbed here as bookkeeping.
+    /// Cancel-safe: the state changes synchronously after each await returns.
+    pub async fn accept_incoming(&mut self) -> Result<Incoming> {
         loop {
             tokio::select! {
                 ev = self.events.next() => match ev {
                     Some((id, CharacteristicControlEvent::Notify(writer))) => {
-                        if let Some(peer) = self.subscribe(id, writer) {
-                            return Ok(peer);
-                        }
+                        let (peer, first) = self.subscribe(id, writer);
+                        return Ok(Incoming::Subscribed { peer, report_id: id, first });
                     }
                     Some((id, CharacteristicControlEvent::Write(req))) => {
                         // Input reports take no writes over the Io path.
@@ -482,8 +490,8 @@ impl LeTransport {
         }
     }
 
-    /// Store a new subscription; `Some(peer)` when this is the peer's first.
-    fn subscribe(&mut self, id: u8, writer: CharacteristicWriter) -> Option<Address> {
+    /// Store a new subscription; the flag is set when it is the peer's first.
+    fn subscribe(&mut self, id: u8, writer: CharacteristicWriter) -> (Address, bool) {
         let peer = writer.device_address();
         let is_new = !self.peers.contains_key(&peer);
         let generation = self.next_generation;
@@ -500,7 +508,7 @@ impl LeTransport {
         };
         let entry = self.peers.entry(peer).or_default();
         entry.subs.insert(id, Sub { writer, generation, watcher });
-        is_new.then_some(peer)
+        (peer, is_new)
     }
 
     /// Drop one subscription (all of them when `generation` is `None`),

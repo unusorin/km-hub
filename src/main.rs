@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use bt::TransportKind;
-use config::{LOCAL_SLOT, Settings};
+use config::Settings;
 use router::{Router, RouterDeps, RouterMsg};
 
 struct Args {
@@ -108,11 +108,12 @@ async fn main() -> Result<()> {
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("state.toml");
-    let bindings = state::load(&state_path, &settings.targets)?;
+    let (bindings, initial_slot) = state::load(&state_path, &settings.targets)?;
     info!(
         config = %args.config.display(),
         state = %state_path.display(),
         bound_slots = bindings.len(),
+        slot = initial_slot,
         "km-hub starting"
     );
     preflight()?;
@@ -123,7 +124,7 @@ async fn main() -> Result<()> {
     // instead of back-pressuring input handling.
     let (frame_tx, frame_rx) = mpsc::channel::<(u8, hid::HidFrame)>(64);
     let (cmd_tx, cmd_rx) = mpsc::channel::<bt::BtCmd>(8);
-    let (slot_tx, slot_rx) = watch::channel(LOCAL_SLOT);
+    let (slot_tx, slot_rx) = watch::channel(initial_slot);
     let (bindings_tx, bindings_rx) = watch::channel(bindings.clone());
 
     // Sink first: discovery must see the virtual devices to exclude them.
@@ -179,6 +180,7 @@ async fn main() -> Result<()> {
         rgb_tx: rgb_tx.clone(),
         bindings_rx,
         mouse_rate_hz: settings.mouse_rate_hz,
+        initial_slot,
     });
     let router_handle = tokio::spawn(router.run(router_rx, cancel.clone()));
     let macro_count = settings.macros.len();
