@@ -13,6 +13,7 @@
 //! there is no dialing on LE.
 
 use std::collections::HashMap;
+use std::num::NonZeroU16;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +41,24 @@ use crate::hid::{BATTERY_LEVEL, BATTERY_REPORT_ID, HidFrame, REPORT_DESCRIPTOR};
 const SVC_HID: u16 = 0x1812;
 const SVC_BATTERY: u16 = 0x180F;
 const SVC_DEVICE_INFO: u16 = 0x180A;
+
+/// Fixed attribute handles for our services. Left to bluetoothd, a service
+/// goes at `last_handle + 1` of its database — so every km-hub restart under
+/// a running bluetoothd (and every GATT re-registration) moves the whole HID
+/// service, and a Pi reboot moves it back. A host that trusts its GATT cache
+/// then reads our attributes at the old handles: BlueZ 5.72 (Ubuntu 24.04)
+/// gets wrong-length answers in hog-lib (`Malformed ATT read response`),
+/// stores the device without HID and segfaults, and never auto-connects
+/// again. Pinned handles make the layout identical every time, so a cache
+/// stays valid. Well above bluetoothd's own GAP/GATT services, with room
+/// for each service to grow.
+const HANDLE_HID: u16 = 0x0100;
+const HANDLE_BATTERY: u16 = 0x0180;
+const HANDLE_DEVICE_INFO: u16 = 0x0200;
+
+fn pinned(handle: u16) -> Option<NonZeroU16> {
+    NonZeroU16::new(handle)
+}
 const CHR_HID_INFORMATION: u16 = 0x2A4A;
 const CHR_REPORT_MAP: u16 = 0x2A4B;
 const CHR_HID_CONTROL_POINT: u16 = 0x2A4C;
@@ -256,6 +275,7 @@ fn hid_service() -> (Service, Vec<(u8, CharacteristicControl)>) {
     });
     let service = Service {
         uuid: Uuid::from_u16(SVC_HID),
+        handle: pinned(HANDLE_HID),
         primary: true,
         characteristics,
         ..Default::default()
@@ -266,6 +286,7 @@ fn hid_service() -> (Service, Vec<(u8, CharacteristicControl)>) {
 fn battery_service() -> Service {
     Service {
         uuid: Uuid::from_u16(SVC_BATTERY),
+        handle: pinned(HANDLE_BATTERY),
         primary: true,
         characteristics: vec![Characteristic {
             uuid: Uuid::from_u16(CHR_BATTERY_LEVEL),
@@ -279,6 +300,7 @@ fn battery_service() -> Service {
 fn device_information_service() -> Service {
     Service {
         uuid: Uuid::from_u16(SVC_DEVICE_INFO),
+        handle: pinned(HANDLE_DEVICE_INFO),
         primary: true,
         characteristics: vec![
             Characteristic {
@@ -687,6 +709,17 @@ mod tests {
         );
         let ids: Vec<u8> = controls.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, vec![REPORT_ID_KEYBOARD, REPORT_ID_MOUSE, REPORT_ID_CONSUMER]);
+
+        // Every service is pinned, in ascending order with room in between:
+        // hosts cache our handles, and a moved service breaks that cache.
+        let handles: Vec<u16> = app.services.iter().map(|s| s.handle.expect("pinned").get()).collect();
+        assert_eq!(handles, vec![HANDLE_HID, HANDLE_BATTERY, HANDLE_DEVICE_INFO]);
+        for w in handles.windows(2) {
+            // 1 declaration + up to 4 handles per characteristic (decl, value,
+            // CCC, Report Reference) — the widest service must fit its slot.
+            let widest = 1 + 4 * app.services.iter().map(|s| s.characteristics.len()).max().unwrap();
+            assert!(usize::from(w[1] - w[0]) >= widest, "{:#06x} too close to {:#06x}", w[1], w[0]);
+        }
 
         let hid = &app.services[0];
         let reports: Vec<&Characteristic> =

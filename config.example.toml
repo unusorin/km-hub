@@ -9,9 +9,11 @@ adapter_alias = "KMHub"
 #             keyboard's channel switch: switching disconnects the current host
 #             and advertises until the target reconnects (~1 s on Linux, ~1.3 s
 #             on macOS, which re-reads the GATT database first). Keys typed in
-#             that gap are held and replayed; pointer motion is not. Other bound
-#             hosts that connect meanwhile are dropped. Keeps one central at a
-#             time on the Pi's radio, which two hosts' anchor points can starve.
+#             that gap are held and replayed; pointer motion is not. Another
+#             bound host that connects meanwhile may idle on the link while the
+#             active one is away, and is dropped as soon as it arrives. Keeps
+#             one served central at a time on the Pi's radio, which two hosts'
+#             anchor points can starve.
 #             The active slot is remembered across restarts.
 #   "all"    — every bound host stays connected; switching is instant.
 # connections = "single"
@@ -95,6 +97,8 @@ slot = 2
 # mac = "AA:BB:CC:DD:EE:FF"   # optional pre-seed; omit to bind via pairing window
 # color = "#0000ff"           # optional; defaults to the [rgb] palette entry
 # brightness = 80             # optional; defaults to [rgb] brightness
+# mac_layout = true          # optional: swap Left Alt <-> Left Cmd for this host,
+#                            # like a Mac-mode keyboard (right side and hotkeys untouched)
 
 # Hooks: run a command when a slot is activated with Ctrl+Alt+SHIFT+F<n>.
 # km-hub only spawns the command — what it does (a webhook, a scene, a script,

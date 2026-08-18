@@ -649,6 +649,14 @@ impl Manager {
         !self.single() || slot == self.active_slot
     }
 
+    /// Single mode: is the active slot's host on the link right now? Both
+    /// notions of connected are checked because bluetoothd's `Connected`
+    /// has been seen lagging behind a fast reconnect.
+    fn active_host_present(&self, transport: &Transport, connected: &HashSet<Address>) -> bool {
+        self.active_host()
+            .is_some_and(|a| connected.contains(&a) || transport.is_peer_connected(a))
+    }
+
     /// Bring the advertisement in line with who is expected to connect (see
     /// `wants_advertising`), unless an unsettled pairing window owns it: that
     /// one is discoverable, and `open_window`/`close_window` handle it.
@@ -670,6 +678,25 @@ impl Manager {
                 // A settled pairing window: stay connectable, stop being seen.
                 if let Err(err) = self.set_advertising(false).await {
                     warn!(%err, "cannot leave discoverable mode");
+                }
+            }
+            (true, true) => {
+                // We hold a handle, but is the instance still registered?
+                // bluetoothd drops an advertisement it could not re-add
+                // (adapter power cycle, controller error under fast
+                // connect/disconnect churn) and bluer's handle never hears
+                // the Release — from here it would look "on" for good and no
+                // host could ever reconnect. The adapter's instance count is
+                // the truth; re-register when it says zero.
+                match self.adapter.active_advertising_instances().await {
+                    Ok(0) => {
+                        warn!("advertisement vanished from the adapter — re-registering");
+                        if let Err(err) = self.set_advertising(false).await {
+                            warn!(%err, "cannot restart advertising");
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => debug!(%err, "cannot read advertising instance count"),
                 }
             }
             (false, true) => {
@@ -814,12 +841,19 @@ impl Manager {
 
     /// Single mode, once a second: a bound host whose slot is not active but
     /// which is connected anyway (it woke up and saw our advertisement, or is
-    /// left over from before a restart) is told to go — unless a pairing
-    /// window is open, which is how a host just bound to another slot looks.
-    /// Both notions of connected are checked because bluetoothd's
-    /// `Connected` has been seen lagging behind a fast reconnect.
+    /// left over from before a restart) is told to go — but only once the
+    /// active slot's host is actually here. Until then it may idle on the
+    /// link: it gets no reports (frames go to the active slot alone), the
+    /// radio has nobody to protect, and the advertisement for the active host
+    /// keeps running beside it. Dropping it earlier just made it come back
+    /// every few seconds for as long as the active host stayed away —
+    /// macOS reconnects to any advertisement of a bonded HID device — which
+    /// is a connect/disconnect loop for hours if that host is off. Nor while
+    /// a pairing window is open, which is how a host just bound to another
+    /// slot looks. Both notions of connected are checked because
+    /// bluetoothd's `Connected` has been seen lagging behind a fast reconnect.
     fn poll_uninvited(&mut self, transport: &mut Transport, connected: &HashSet<Address>) {
-        if !self.single() || self.pairing.is_some() {
+        if !self.single() || self.pairing.is_some() || !self.active_host_present(transport, connected) {
             return;
         }
         let now = Instant::now();
@@ -1003,13 +1037,21 @@ impl Manager {
         if let Some(slot) = self.slot_of(peer) {
             // A bound host. Single mode serves only the active slot's; one
             // that shows up anyway (it woke and saw us advertising for
-            // another host) is sent away — except during a pairing window,
-            // when it is most likely the host that was just bound to another
-            // slot and is still finishing its bond.
+            // another host) is sent away if the active host is here — except
+            // during a pairing window, when it is most likely the host that
+            // was just bound to another slot and is still finishing its
+            // bond. While the active host is away it may idle on the link
+            // instead (see `poll_uninvited`); it is evicted the tick the
+            // active host arrives.
             if !self.serves(slot) && self.pairing.is_none() {
-                info!(%peer, slot, active = self.active_slot, "bound host connected while its slot is not active — dropping");
-                transport.drop_peer(peer);
-                self.evicted.insert(peer, Instant::now());
+                let connected = self.connected_hosts().await;
+                if self.active_host_present(transport, &connected) {
+                    info!(%peer, slot, active = self.active_slot, "bound host connected while its slot is not active — dropping");
+                    transport.drop_peer(peer);
+                    self.evicted.insert(peer, Instant::now());
+                } else {
+                    debug!(%peer, slot, active = self.active_slot, "bound host connected while its slot is not active — idling until the active host is back");
+                }
             }
             return;
         }

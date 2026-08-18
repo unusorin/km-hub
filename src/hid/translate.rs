@@ -26,11 +26,20 @@ pub struct Translator {
     /// array, so only the most recent of several held media keys is reported.
     consumer: u16,
     consumer_dirty: bool,
+    /// Swap Left Alt and Left GUI on the way out. `modifiers` always holds
+    /// the physical state; the swap is applied when the frame is built, so a
+    /// press and its release are mapped alike no matter which path releases.
+    mac_layout: bool,
 }
 
 impl Translator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Enable/disable the Left Alt <-> Left GUI swap for the active host.
+    pub fn set_mac_layout(&mut self, on: bool) {
+        self.mac_layout = on;
     }
 
     /// Feed a key event (`value`: 0 = release, 1 = press, 2 = repeat).
@@ -195,7 +204,12 @@ impl Translator {
 
     fn keyboard_frame(&self) -> HidFrame {
         let k = &self.keys;
-        HidFrame::Keyboard([1, self.modifiers, 0, k[0], k[1], k[2], k[3], k[4], k[5]])
+        let mods = if self.mac_layout {
+            swap_left_alt_gui(self.modifiers)
+        } else {
+            self.modifiers
+        };
+        HidFrame::Keyboard([1, mods, 0, k[0], k[1], k[2], k[3], k[4], k[5]])
     }
 
     fn consumer_frame(&self) -> HidFrame {
@@ -247,6 +261,12 @@ fn consumer_usage(key: KeyCode) -> Option<u16> {
 }
 
 /// evdev key code → HID usage (keyboard page 0x07).
+/// Mac layout: Left Alt (bit 2) and Left GUI (bit 3) trade places so the key
+/// next to Space is Cmd, as on an Apple keyboard. Right side untouched.
+fn swap_left_alt_gui(m: u8) -> u8 {
+    (m & !0b1100) | ((m & 0b0100) << 1) | ((m & 0b1000) >> 1)
+}
+
 fn key_usage(key: KeyCode) -> Option<Usage> {
     use KeyCode as K;
     use Usage::{Key, Modifier};
@@ -398,6 +418,59 @@ mod tests {
             t.flush(),
             vec![HidFrame::Keyboard([1, 0b1000_0010, 0, 0, 0, 0, 0, 0, 0])]
         );
+    }
+
+    fn kbd(mods: u8) -> Vec<HidFrame> {
+        vec![HidFrame::Keyboard([1, mods, 0, 0, 0, 0, 0, 0, 0])]
+    }
+
+    #[test]
+    fn mac_layout_swaps_left_alt_and_gui() {
+        let mut t = Translator::new();
+        t.set_mac_layout(true);
+        // Left Alt goes out as Left GUI (Cmd) ...
+        t.handle_key(KeyCode::KEY_LEFTALT, 1);
+        assert_eq!(t.flush(), kbd(0b0000_1000));
+        // ... and both held together still fill both bits.
+        t.handle_key(KeyCode::KEY_LEFTMETA, 1);
+        assert_eq!(t.flush(), kbd(0b0000_1100));
+        // Releasing the physical Alt drops the *GUI* bit it was sent as.
+        t.handle_key(KeyCode::KEY_LEFTALT, 0);
+        assert_eq!(t.flush(), kbd(0b0000_0100));
+        t.handle_key(KeyCode::KEY_LEFTMETA, 0);
+        assert_eq!(t.flush(), kbd(0));
+        // The right side is left alone.
+        t.handle_key(KeyCode::KEY_RIGHTALT, 1);
+        t.handle_key(KeyCode::KEY_RIGHTMETA, 1);
+        assert_eq!(t.flush(), kbd(0b1100_0000));
+    }
+
+    #[test]
+    fn mac_layout_off_by_default_and_toggle_stays_symmetric() {
+        let mut t = Translator::new();
+        t.handle_key(KeyCode::KEY_LEFTALT, 1);
+        assert_eq!(t.flush(), kbd(0b0000_0100));
+        // Turning the swap on mid-hold re-maps the held key on the next
+        // frame; state is physical, so nothing gets stuck.
+        t.set_mac_layout(true);
+        t.handle_key(KeyCode::KEY_A, 1);
+        assert_eq!(
+            t.flush(),
+            vec![HidFrame::Keyboard([1, 0b0000_1000, 0, 0x04, 0, 0, 0, 0, 0])]
+        );
+        t.handle_key(KeyCode::KEY_A, 0);
+        t.handle_key(KeyCode::KEY_LEFTALT, 0);
+        assert_eq!(t.flush(), kbd(0));
+    }
+
+    #[test]
+    fn mac_layout_release_all_is_clean() {
+        let mut t = Translator::new();
+        t.set_mac_layout(true);
+        t.handle_key(KeyCode::KEY_LEFTALT, 1);
+        t.flush();
+        assert_eq!(t.release_all(), kbd(0));
+        assert!(t.flush().is_empty());
     }
 
     #[test]

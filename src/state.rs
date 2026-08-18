@@ -156,6 +156,7 @@ mod tests {
             addr: mac.map(addr),
             color: None,
             brightness: None,
+            mac_layout: false,
         }
     }
 

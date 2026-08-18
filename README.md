@@ -117,9 +117,12 @@ slot = 2
 name = "macbook"
 slot = 3
 # mac = "AA:BB:CC:DD:EE:FF"   # optional: pre-seed a slot with a known address
+# mac_layout = true          # optional: swap Left Alt <-> Left Cmd on this host
 ```
 
 Learned bindings and the last active slot are stored in `state.toml` next to `config.toml`.
+
+`mac_layout` gives a slot the Mac modifier layout (as MX Keys' Mac mode does): while that slot is active, Left Alt is sent as Cmd and Left Super as Option, so the key next to Space is Cmd. Off by default, per slot, left side only; the Ctrl+Alt+F<n> hotkeys and macros still match the physical keys, and the local slot is never remapped.
 
 ### Lighting (optional)
 
@@ -302,8 +305,20 @@ A systemd unit is provided (`km-hub.service`, `make install`) if you want it on 
   instantly at the cost of every host sharing the radio.
 - *LE: a host connects and is dropped right away* (`bound host connected while its slot is not
   active — dropping`) — single mode serves only the active slot; press that host's `Ctrl+Alt+F<n>`.
-  A host bound during a pairing window is kept until the window closes, then dropped unless you
-  switched to it.
+  This only happens while the active slot's host is connected; while it is away (off, asleep,
+  rebooting) another bound host may stay connected idle — it gets no input, and is dropped the
+  moment the active host comes back. A host bound during a pairing window is kept until the
+  window closes.
+- *LE: nobody can reconnect until km-hub is restarted* — bluetoothd can silently drop the
+  advertisement (`advertisement vanished from the adapter — re-registering` in the log once
+  km-hub notices, within a second). If it recurs, `bluetoothctl show | grep ActiveInstances` on
+  the Pi shows `0x00` while km-hub believes it is advertising; the journal on the Pi is volatile,
+  so capture it before rebooting.
+- *A Linux host will not reconnect after a reboot, and `bluetoothctl info <hub>` on it lists no
+  `Human Interface Device`* — its bluetoothd rewrote the record without HID (BlueZ 5.72 does this
+  mid-rediscovery, and can crash there). While the hub advertises for that slot run
+  `bluetoothctl connect <hub>` on the host; the record is rewritten with HID and auto-connect is
+  back. If that fails, `bluetoothctl remove <hub>` and re-pair through a pairing window.
 - *LE: a Linux host stopped auto-connecting after its reboot* — its BlueZ record lost the HID
   service (`bluetoothctl info <hub>` on the host lists no `Human Interface Device`); happens when
   the hub's GATT services vanish or get re-registered while it is connected. One

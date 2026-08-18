@@ -181,6 +181,7 @@ async fn main() -> Result<()> {
         bindings_rx,
         mouse_rate_hz: settings.mouse_rate_hz,
         initial_slot,
+        mac_layout_slots: settings.mac_layout_slots(),
     });
     let router_handle = tokio::spawn(router.run(router_rx, cancel.clone()));
     let macro_count = settings.macros.len();

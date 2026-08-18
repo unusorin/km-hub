@@ -57,6 +57,8 @@ pub struct Router {
     /// A combo F-key being held: once the deadline passes, the slot is asked to
     /// re-pair (see `REPAIR_HOLD`).
     repair_hold: Option<RepairHold>,
+    /// Slots that get the Mac modifier layout; see `RouterDeps`.
+    mac_layout_slots: HashSet<u8>,
 }
 
 /// How long a slot's combo must be held to force it to re-pair — Shift makes
@@ -87,6 +89,9 @@ pub struct RouterDeps {
     /// Slot to start on: the one remembered in the state file, or the local
     /// slot. Restoring fires no hooks — only a combo does that.
     pub initial_slot: u8,
+    /// Slots whose host wants Left Alt/Left GUI swapped (Mac layout); see
+    /// `Translator::set_mac_layout`. Config-only, so never the local slot.
+    pub mac_layout_slots: HashSet<u8>,
 }
 
 impl Router {
@@ -103,12 +108,17 @@ impl Router {
             bindings_rx,
             mouse_rate_hz,
             initial_slot,
+            mac_layout_slots,
         } = deps;
         let mouse_interval = Duration::from_micros(1_000_000 / u64::from(mouse_rate_hz.max(1)));
+        // A restart lands on the remembered slot without a switch, so the
+        // layout must be set here too.
+        let mut translator = Translator::new();
+        translator.set_mac_layout(mac_layout_slots.contains(&initial_slot));
         Self {
             slot: initial_slot,
             fsm: HotkeyFsm::with_macros(macros),
-            translator: Translator::new(),
+            translator,
             sink,
             bt_tx,
             bt_cmd_tx,
@@ -123,6 +133,7 @@ impl Router {
             mouse_last_sent: Instant::now() - mouse_interval,
             mouse_flush_at: None,
             repair_hold: None,
+            mac_layout_slots,
         }
     }
 
@@ -353,8 +364,19 @@ impl Router {
                 self.send_frame(frame);
             }
         }
+        // Everything is released on the old host; the new host gets its own
+        // modifier layout from the first report on.
+        let mac_layout = self.mac_layout_slots.contains(&slot);
+        self.translator.set_mac_layout(mac_layout);
 
-        info!(from = self.slot, to = slot, target = name, hooks = fire_hooks, "switching target");
+        info!(
+            from = self.slot,
+            to = slot,
+            target = name,
+            hooks = fire_hooks,
+            mac_layout,
+            "switching target"
+        );
         self.slot = slot;
         let _ = self.slot_tx.send(slot);
         if fire_hooks {

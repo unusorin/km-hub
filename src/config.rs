@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -78,6 +78,10 @@ struct RawTarget {
     color: Option<String>,
     /// Lighting brightness for this slot; falls back to `[rgb] brightness`.
     brightness: Option<u8>,
+    /// Swap Left Alt and Left GUI (Cmd) in reports to this host, the way a
+    /// Mac-mode keyboard does. Right-side modifiers are untouched.
+    #[serde(default)]
+    mac_layout: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -203,6 +207,8 @@ pub struct RemoteTarget {
     pub addr: Option<bluer::Address>,
     pub color: Option<Rgb>,
     pub brightness: Option<u8>,
+    /// Left Alt <-> Left GUI swapped in reports to this host.
+    pub mac_layout: bool,
 }
 
 /// What a hook runs. The two forms differ only in whether a shell interprets
@@ -401,6 +407,7 @@ impl Settings {
                 addr,
                 color,
                 brightness: t.brightness,
+                mac_layout: t.mac_layout,
             });
         }
 
@@ -474,6 +481,13 @@ impl Settings {
     pub fn target_for_slot(&self, slot: u8) -> Option<&RemoteTarget> {
         self.targets.iter().find(|t| t.slot == slot)
     }
+
+    /// Slots whose reports get Left Alt/Left GUI swapped. Only a `[[target]]`
+    /// can ask for it, so slots bound via a pairing window alone are never
+    /// swapped, and neither is the local slot.
+    pub fn mac_layout_slots(&self) -> HashSet<u8> {
+        self.targets.iter().filter(|t| t.mac_layout).map(|t| t.slot).collect()
+    }
 }
 
 #[cfg(test)]
@@ -538,6 +552,30 @@ mod tests {
         assert_eq!(lighting.slot_color(4), rgb("#ff0000"));
         // A slot with no target entry at all (bound via a pairing window).
         assert_eq!(lighting.slot_color(5), rgb("#0000ff"));
+    }
+
+    #[test]
+    fn mac_layout_is_off_unless_a_target_asks_for_it() {
+        let settings = Settings::parse(
+            r#"
+            [[target]]
+            name = "tower"
+            slot = 2
+
+            [[target]]
+            name = "macbook"
+            slot = 3
+            mac_layout = true
+            "#,
+        )
+        .unwrap();
+        assert!(!settings.target_for_slot(2).unwrap().mac_layout);
+        assert!(settings.target_for_slot(3).unwrap().mac_layout);
+        // Only the opted-in slot; slots without a target entry never appear.
+        assert_eq!(settings.mac_layout_slots(), HashSet::from([3]));
+        // Empty when nothing opts in.
+        let none = Settings::parse("[[target]]\nname = \"tower\"\nslot = 2\n").unwrap();
+        assert!(none.mac_layout_slots().is_empty());
     }
 
     #[test]
